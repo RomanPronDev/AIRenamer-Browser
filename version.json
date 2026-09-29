@@ -1,0 +1,4 @@
+{
+  "version": "0.26.29",
+  "release_notes": "Prepare automatic Browser updates and download FFmpeg only when first needed."
+}
