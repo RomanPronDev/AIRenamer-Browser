@@ -1,4 +1,4 @@
 {
-  "version": "0.26.29",
-  "release_notes": "Prepare automatic Browser updates and download FFmpeg only when first needed."
+  "version": "0.27.0",
+  "release_notes": "Manage project folder paths in Settings and prompt for a project only when none is configured."
 }

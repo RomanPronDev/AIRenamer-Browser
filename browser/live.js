@@ -7,7 +7,7 @@ const state = {
   recent: {downloads: [], managed: []}, tabId: null, windowId: null, query: "",
   selected: new Set(), modal: null, openMenu: null, busy: false, error: "",
   generation: 0, theme: "system", paneHeights: {shots:126,files:240}, resizing: null,
-  conversions: new Map(),
+  conversions: new Map(), setupDismissed: false,
 };
 const mediaExt = /\.(png|jpe?g|tiff?|webp|avif|gif|exr|mp4|mov|mkv|webm|avi|m4v)$/i;
 const thumbnailCache = new Map();
@@ -139,16 +139,32 @@ function paintThumbnail(node,data){
 function modalHtml() {
   if (!state.modal) return "";
   const modal = state.modal;
-  const heading = modal.kind==="settings"?"Settings":modal.kind==="preview"?"Preview":
+  const heading = modal.kind==="settings"?"Settings":modal.kind==="setup"?"Choose a project folder":
+    modal.kind==="remove-project"?"Remove project shortcut":modal.kind==="preview"?"Preview":
     modal.kind==="move"?(modal.items?.length>1?"Move "+modal.items.length+" files":"Move file"):"File actions";
   let body = "";
   if (modal.kind==="settings") {
-    body = '<label>Theme<select id="theme-setting">'+
+    body = '<div class="settings-section"><div class="section-title">PROJECT FOLDERS</div>'+
+      (state.projects.length?state.projects.map(project=>
+        '<div class="project-setting"><div class="project-setting-info"><strong>'+esc(project.name)+'</strong><span title="'+esc(project.path)+'">'+esc(project.path)+'</span>'+
+        '<small>'+esc(project.layout==="sequences"?'Sequences → Shots':'Shots directly')+(project.available?'':' · Folder unavailable')+'</small></div>'+
+        '<div class="project-setting-actions"><button data-action="change-project-path" data-project="'+esc(project.name)+'">Change folder</button>'+
+        '<button data-action="ask-remove-project" data-project="'+esc(project.name)+'" aria-label="Remove '+esc(project.name)+' shortcut">Remove</button></div></div>').join(''):
+        '<p class="hint">Choose a project root folder to start. For example: D:\\Projects\\MyProject.</p>')+
+      '<button class="small-action" data-action="add-project">'+icon("plus")+' Add project folder</button></div>'+
+      '<label>Theme<select id="theme-setting">'+
       ['system','light','dark'].map(value=>'<option value="'+value+'" '+(state.theme===value?'selected':'')+'>'+value[0].toUpperCase()+value.slice(1)+'</option>').join('')+
       '</select></label><label>Ignored folder names<textarea id="ignored-names" rows="3" spellcheck="false" placeholder="One name per line">'+
       esc((modal.ignoredNames||[]).filter(name=>name.toLowerCase()!=="_shotcode").join("\n"))+
       '</textarea></label><p class="hint">_shotcode is always ignored. Add one folder name per line.</p>'+
       '<button class="primary wide" data-action="save-settings">Save settings</button>';
+  } else if (modal.kind==="setup") {
+    body = '<p>Select the root folder of one project, for example <code>D:\\Projects\\MyProject</code>. AIRenamer will detect whether it contains sequences or shots.</p>'+
+      '<button class="primary wide" data-action="add-project">'+icon("folder")+' Choose project folder</button>'+
+      '<p class="hint">You can add more project folders later in Settings.</p>';
+  } else if (modal.kind==="remove-project") {
+    body = '<p>Remove <strong>'+esc(modal.project)+'</strong> from AIRenamer? Its folder and files will stay on disk.</p>'+
+      '<button class="primary wide" data-action="confirm-remove-project">Remove shortcut</button>';
   } else if (modal.kind==="preview") {
     body = '<p class="menu-file">'+esc(modal.name)+'</p>'+(modal.data?.available ? (modal.data.mediaType==="video" ?
       '<video class="preview-video" controls playsinline preload="metadata" src="'+esc(modal.data.url)+'"></video>'+
@@ -187,7 +203,7 @@ function navigationHtml() {
   ).join("");
   const hasSequences = state.project && state.layout==="sequences";
   const projects = '<div class="picker project-picker"><button class="picker-trigger" data-action="toggle-projects" aria-label="Project: '+esc(state.project||'select')+'" aria-haspopup="menu" aria-expanded="'+(state.openMenu==="project")+'"><span class="picker-value">'+esc(state.project||'Project')+'</span>'+icon("chevron")+'</button>'+
-    (state.openMenu==="project"?'<div class="picker-menu" role="menu" aria-label="Projects">'+(projectItems||'<div class="picker-empty">No projects yet</div>')+'<button class="picker-option add-option" data-action="add-project" role="menuitem">'+icon("plus")+'Add project</button></div>':"")+'</div>';
+    (state.openMenu==="project"?'<div class="picker-menu" role="menu" aria-label="Projects">'+(projectItems||'<div class="picker-empty">No projects yet</div>')+'<button class="picker-option add-option" data-action="settings" role="menuitem">'+icon("settings")+'Manage project folders</button></div>':"")+'</div>';
   const sequences = '<div class="picker sequence-picker"><button class="picker-trigger" data-action="toggle-sequences" aria-label="Sequence: '+esc(state.sequence||'select')+'" aria-haspopup="menu" aria-expanded="'+(state.openMenu==="sequence")+'" '+(!hasSequences?'disabled':'')+'><span class="picker-value">'+esc(hasSequences?(state.sequence||'Sequence'):(state.project?'No sequences':'Sequence'))+'</span>'+icon("chevron")+'</button>'+
     (state.openMenu==="sequence"?'<div class="picker-menu" role="menu" aria-label="Sequences">'+(sequenceItems||'<div class="picker-empty">No sequences available</div>')+'</div>':"")+'</div>';
   const filteredShots = state.shots.filter(shot=>shot.toLowerCase().includes(state.query.toLowerCase()));
@@ -197,7 +213,7 @@ function navigationHtml() {
   return '<section class="navigation"><div class="nav-pickers">'+projects+sequences+'</div>'+
     (state.project?'<div class="shot-tools"><span>SHOTS <b>'+state.shots.length+'</b></span><div class="search">'+icon("search")+'<input id="shot-search" type="search" placeholder="Find shot" aria-label="Find shot" value="'+esc(state.query)+'"></div></div>'+
       '<div class="shots">'+(shots||'<div class="shot-empty">'+(state.query?'No shots match this search. <button data-action="clear-shot-search">Clear search</button>':(state.layout==="sequences"&&!state.sequence?'Select a sequence to view shots.':'No shots in this location.'))+'</div>')+'</div>':"")+
-    (!state.projects.length?'<div class="empty compact">Add a project from the menu above.</div>':"")+
+    (!state.projects.length?'<div class="empty compact">Choose a project folder in Settings.</div>':"")+
     '</section>';
 }
 function render() {
@@ -252,6 +268,7 @@ async function refreshProjects({quiet=false}={}) {
     state.connected=true;state.error="";
     state.projects=data.projects;state.categories=data.categories;
     if(!state.projects.some(p=>p.name===state.project)){state.project="";state.sequence="";state.shot="";state.files=[];}
+    if(!state.projects.length&&!state.modal&&!state.setupDismissed)state.modal={kind:"setup"};
     render();
     if(state.project)await refreshNavigation();
   } catch(error) {
@@ -363,6 +380,7 @@ async function importFiles(files, destination=currentDestination()) {
   finally{setBusy(false);}
 }
 async function openSettings() {
+  state.openMenu=null;
   const data=await native("preferences");
   state.modal={kind:"settings",ignoredNames:data.ignoredNames};render();
 }
@@ -414,7 +432,10 @@ async function changeMove(level,value) {
 root.addEventListener("click",async event=>{
   const button=event.target.closest("[data-action]");
   if(!button){
-    if(event.target.classList.contains("overlay")){state.modal=null;render();}
+    if(event.target.classList.contains("overlay")){
+      if(state.modal?.kind==="setup")state.setupDismissed=true;
+      state.modal=null;render();
+    }
     else if(state.openMenu&&!event.target.closest(".nav-pickers")){
       state.openMenu=null;q(".picker-menu")?.remove();
       root.querySelectorAll(".picker-trigger").forEach(item=>item.setAttribute("aria-expanded","false"));
@@ -432,9 +453,36 @@ root.addEventListener("click",async event=>{
     else if(action==="select-sequence")await selectSequence(button.dataset.sequence);
     else if(action==="add-project"){
       state.openMenu=null;
+      const fromSettings=state.modal?.kind==="settings";
       const result=await native("add_project");
-      if(!result.cancelled)await selectProject(result.name);
+      if(!result.cancelled){
+        state.modal=null;
+        await refreshProjects();
+        await selectProject(result.name);
+        if(fromSettings)await openSettings();
+      }
+    }
+    else if(action==="change-project-path"){
+      const result=await native("change_project_path",{project:button.dataset.project});
+      if(!result.cancelled){
+        const wasSelected=state.project===button.dataset.project;
+        state.modal=null;
+        await refreshProjects();
+        if(wasSelected)await selectProject(result.name);
+        await openSettings();
+      }
+    }
+    else if(action==="ask-remove-project"){
+      state.modal={kind:"remove-project",project:button.dataset.project};render();
+    }
+    else if(action==="confirm-remove-project"){
+      const project=state.modal.project;
+      await native("remove_project",{project});
+      if(state.project===project){state.project="";state.sequence="";state.shot="";await saveDestination();}
+      state.modal=null;
+      if(!state.projects.some(item=>item.name!==project))state.setupDismissed=true;
       await refreshProjects();
+      await openSettings();
     }
     else if(action==="shot")await chooseShot(button.dataset.shot);
     else if(action==="clear-shot-search"){state.query="";render();q("#shot-search")?.focus();}
@@ -448,7 +496,11 @@ root.addEventListener("click",async event=>{
       state.modal=null;render();
       if(state.project)await refreshNavigation();
     }
-    else if(action==="close"){state.modal=null;render();}
+    else if(action==="close"){
+      if(state.modal?.kind==="setup")state.setupDismissed=true;
+      if(state.modal?.kind==="remove-project"){await openSettings();return;}
+      state.modal=null;render();
+    }
     else if(action==="clear-selection"){state.selected.clear();render();}
     else if(action==="batch-rename"){
       if(state.busy)return;

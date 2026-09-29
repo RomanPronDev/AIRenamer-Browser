@@ -1,4 +1,4 @@
-# AIRenamer Browser — 0.26.29
+# AIRenamer Browser — 0.27.0
 
 AIRenamer is a Chrome side panel connected to the same local projects, shot files, naming rules, and move operations as the desktop application. All panel labels are in English. Chrome starts the local Native Messaging companion when needed; the desktop application does not have to stay open.
 
@@ -16,6 +16,8 @@ Setup reuses a working `%LOCALAPPDATA%\MediaRenamer\Tools\ffmpeg.exe`. If it is 
 ## In the panel
 
 Select a project from the picker at the top. Projects with sequences show a second picker; projects whose first-level folders are shots show those shots directly. Project, sequence, and shot selection persist when switching Chrome tabs. Click a shot to list its files. Drop downloaded media onto a shot or use **To shot** in Recent Downloads to import and rename it.
+
+**Project folders** are managed in Settings. Add a root folder, change an existing project's folder, or remove its shortcut without deleting files. The Browser and desktop app use the same per-machine project list and detected layouts. If that list is empty when the Browser first opens, it shows a folder-selection welcome dialog. Existing project paths remain untouched during installation and updates, including paths to temporarily unavailable drives.
 
 **Recent Downloads** lists the complete Chrome download history, including non-media files. Previews never load automatically: click the thumbnail icon to load a small preview of one file, or click its name to load and open its preview. Only that selected file is requested; its preview is reused if you click it again. Unsupported formats stay as icons.
 

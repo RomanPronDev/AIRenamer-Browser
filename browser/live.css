@@ -108,3 +108,16 @@ button.recent-thumb:hover{outline:1px solid #91aa8b}
 :root[data-theme="dark"] .small-action:hover{background:#344336}
 :root[data-theme="dark"] .error{background:#452e2c;border-color:#79514b;color:#ffd2cb}
 :root[data-theme="dark"] .overlay{background:#080e0bcc}
+.settings-section{border-bottom:1px solid var(--line);padding-bottom:13px;margin-bottom:13px}
+.settings-section>.section-title{margin-bottom:7px}
+.settings-section>.small-action{display:inline-flex;align-items:center;gap:5px;margin-top:7px}
+.settings-section>.small-action svg{width:14px;height:14px}
+.project-setting{display:flex;flex-direction:column;gap:5px;padding:8px 0;border-bottom:1px solid var(--line)}
+.project-setting-info{display:flex;flex-direction:column;gap:3px;min-width:0}
+.project-setting-info strong{font-size:12px}
+.project-setting-info span{font:10px Consolas,monospace;overflow-wrap:anywhere;color:var(--muted)}
+.project-setting-info small{font-size:10px;color:var(--muted)}
+.project-setting-actions{display:flex;gap:8px}
+.project-setting-actions button{font-size:10px;color:var(--green);padding:4px 0;text-decoration:underline}
+.project-setting-actions button:hover{color:var(--accent)}
+.dialog code{font:11px Consolas,monospace;overflow-wrap:anywhere}

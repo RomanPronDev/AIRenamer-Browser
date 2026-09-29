@@ -57,6 +57,56 @@ class BrowserNativeTests(unittest.TestCase):
         self.assertFalse(files[0]["hasPsd"])
         self.assertEqual(self.source.read_bytes(), b"test-image")
 
+    def test_project_path_changes_preserve_other_shortcuts(self):
+        root = Path(self.temp.name)
+        another = root / "ANOTHER"
+        another.mkdir()
+        relocated = root / "RELOCATED"
+        relocated.mkdir()
+        saved = {}
+        modes = {"DEMO": "shots", "ANOTHER": "sequences"}
+        saved.update({"DEMO": str(self.project), "ANOTHER": str(another)})
+
+        def persist(projects, *, project_modes):
+            saved.clear()
+            saved.update(projects)
+            modes.clear()
+            modes.update(project_modes)
+
+        with patch.object(config, "get_projects", side_effect=lambda: dict(saved)), \
+             patch.object(config, "get_project_modes", side_effect=lambda: dict(modes)), \
+             patch.object(config, "save_projects", side_effect=persist), \
+             patch.object(config, "detect_project_layout", return_value="shots"):
+            result = self.host.change_project_path({"project": "DEMO", "path": str(relocated)})
+            self.assertEqual(result["name"], "RELOCATED")
+            self.assertEqual(saved, {"ANOTHER": str(another), "RELOCATED": str(relocated)})
+            self.assertEqual(modes["ANOTHER"], "sequences")
+            self.host.remove_project({"project": "RELOCATED"})
+            self.assertEqual(saved, {"ANOTHER": str(another)})
+            self.assertTrue(relocated.is_dir())
+
+    def test_existing_project_list_is_read_without_rewriting_paths(self):
+        original = str(self.project)
+        with patch.object(config, "save_projects", side_effect=AssertionError("unexpected write")):
+            self.assertEqual(self.host.projects()["projects"][0]["path"], original)
+
+    def test_first_project_folder_is_saved_only_after_selection(self):
+        with patch.object(config, "get_projects", return_value={}), \
+             patch.object(config, "get_project_modes", return_value={}), \
+             patch.object(config, "save_projects") as save, \
+             patch.object(browser_native, "_choose_project_folder", return_value=""):
+            self.assertEqual(self.host.add_project({}), {"cancelled": True})
+            save.assert_not_called()
+        with patch.object(config, "get_projects", return_value={}), \
+             patch.object(config, "get_project_modes", return_value={}), \
+             patch.object(config, "save_projects") as save, \
+             patch.object(config, "detect_project_layout", return_value="shots"), \
+             patch.object(browser_native, "_choose_project_folder", return_value=str(self.project)):
+            result = self.host.add_project({})
+            self.assertEqual(result["name"], "DEMO")
+            save.assert_called_once_with({"DEMO": str(self.project)},
+                                         project_modes={"DEMO": "shots"})
+
     def test_drag_url_streams_validated_project_file_from_loopback(self):
         imported = self.host.import_file({**self.target(), "source": str(self.source)})
         record = self.host.files(self.target())["files"][0]

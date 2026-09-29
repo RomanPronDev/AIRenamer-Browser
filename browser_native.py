@@ -45,6 +45,33 @@ def _component(value: object, name: str) -> str:
     return value
 
 
+def _choose_project_folder(initial: str = "") -> str:
+    """Show the native Windows folder picker without bundling Tk or Qt."""
+    if os.name != "nt":
+        raise HostError("Folder selection is available only on Windows")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        "$dialog.Description = 'Select project folder'; "
+        "if ($env:AIRENAMER_PICKER_INITIAL -and "
+        "(Test-Path -LiteralPath $env:AIRENAMER_PICKER_INITIAL -PathType Container)) "
+        "{ $dialog.SelectedPath = $env:AIRENAMER_PICKER_INITIAL }; "
+        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+        "{ [Console]::Out.Write($dialog.SelectedPath) }; "
+        "$dialog.Dispose()"
+    )
+    env = utils.sanitized_subprocess_environment()
+    env["AIRENAMER_PICKER_INITIAL"] = initial
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Sta", "-Command", script],
+        capture_output=True, text=True, timeout=300, env=env,
+        creationflags=0x08000000,
+    )
+    if result.returncode:
+        raise HostError("Could not open the project folder picker")
+    return result.stdout.strip()
+
+
 def _children(parent: str) -> list[str]:
     try:
         return sorted(
@@ -356,21 +383,12 @@ class BrowserHost:
     def add_project(self, payload):
         folder = payload.get("path")
         if not folder:
-            # User gesture in the extension initiates the native OS picker.
-            import tkinter
-            from tkinter import filedialog
-            root = tkinter.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            try:
-                folder = filedialog.askdirectory(
-                    parent=root, title="Select project folder", mustexist=True
-                )
-            finally:
-                root.destroy()
+            folder = _choose_project_folder()
         if not folder:
             return {"cancelled": True}
-        folder = os.path.normpath(os.path.abspath(folder))
+        if not isinstance(folder, str) or not os.path.isabs(folder):
+            raise HostError("Project path must be absolute")
+        folder = os.path.normpath(folder)
         if not os.path.isdir(folder):
             raise HostError("Project folder unavailable")
         projects = config.get_projects()
@@ -387,6 +405,49 @@ class BrowserHost:
         modes[name] = config.detect_project_layout(folder)
         config.save_projects(projects, project_modes=modes)
         return {"name": name, "layout": modes[name], "path": folder}
+
+    def change_project_path(self, payload):
+        old_name = _component(payload.get("project"), "project")
+        projects = config.get_projects()
+        if old_name not in projects:
+            raise HostError("Unknown project")
+        folder = payload.get("path")
+        if not folder:
+            folder = _choose_project_folder(projects[old_name])
+        if not folder:
+            return {"cancelled": True}
+        if not isinstance(folder, str) or not os.path.isabs(folder):
+            raise HostError("Project path must be absolute")
+        folder = os.path.normpath(folder)
+        if not os.path.isdir(folder):
+            raise HostError("Project folder unavailable")
+        name = os.path.basename(folder.rstrip("\\/")) or folder
+        if not config._is_windows_safe_component(name):
+            raise HostError("Invalid project folder name")
+        if any(existing != old_name and (
+            existing.casefold() == name.casefold() or
+            os.path.normcase(os.path.normpath(path)) == os.path.normcase(folder)
+        ) for existing, path in projects.items()):
+            raise HostError("Project name or folder already exists")
+        if name != old_name:
+            del projects[old_name]
+        projects[name] = folder
+        modes = config.get_project_modes()
+        modes.pop(old_name, None)
+        modes[name] = config.detect_project_layout(folder)
+        config.save_projects(projects, project_modes=modes)
+        return {"name": name, "path": folder, "layout": modes[name]}
+
+    def remove_project(self, payload):
+        name = _component(payload.get("project"), "project")
+        projects = config.get_projects()
+        if name not in projects:
+            raise HostError("Unknown project")
+        del projects[name]
+        modes = config.get_project_modes()
+        modes.pop(name, None)
+        config.save_projects(projects, project_modes=modes)
+        return {"removed": name}
 
     def navigation(self, payload):
         name = payload["project"]
@@ -704,6 +765,8 @@ class BrowserHost:
             "preferences": self.preferences,
             "set_ignored_names": self.set_ignored_names,
             "add_project": self.add_project,
+            "change_project_path": self.change_project_path,
+            "remove_project": self.remove_project,
             "navigation": self.navigation,
             "files": self.files,
             "import_file": self.import_file,

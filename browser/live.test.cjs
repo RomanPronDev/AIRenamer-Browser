@@ -38,3 +38,28 @@ test('Recent Downloads requests a preview only after one file is clicked',async(
   await click('preview-recent');
   assert.equal(calls.filter(item=>item.type==='preview_download').length,1);
 });
+
+test('project picker appears only when no folders are configured',async()=>{
+  async function start(projects){
+    const root={innerHTML:'',addEventListener(){},querySelector(){return null;},querySelectorAll(){return [];}};
+    const chrome={runtime:{getManifest:()=>({version:'0.27.0'}),onMessage:{addListener(){}},
+      async sendMessage(message){
+        if(message.kind==='checkUpdate')return {ok:true,result:{reloading:false}};
+        if(message.kind==='recent')return {ok:true,result:{downloads:[],managed:[]}};
+        if(message.kind==='native'&&message.type==='projects')return {ok:true,result:{projects,categories:[]}};
+        if(message.kind==='native'&&message.type==='navigation')return {ok:true,result:{layout:'shots',sequences:[],shots:[]}};
+        throw Error(JSON.stringify(message));
+      }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
+      storage:{local:{get:async()=>({}),set:async()=>{}}}};
+    vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+      document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
+      window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
+      setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
+    });
+    await new Promise(resolve=>setTimeout(resolve,0));
+    return root.innerHTML;
+  }
+  assert.match(await start([]),/Choose a project folder/);
+  assert.doesNotMatch(await start([{name:'Existing',path:'D:\\Work\\Existing',layout:'shots',available:true}]),
+    /role="dialog"[^>]*aria-label="Choose a project folder"/);
+});
