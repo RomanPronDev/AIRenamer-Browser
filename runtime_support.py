@@ -321,15 +321,24 @@ def write_emergency_diagnostic(message: str, environ=None) -> str:
 
 
 def _lock_owner_status(lock_path: str) -> str:
-    """Return ``alive``, ``dead``, or ``unknown`` for lock ownership."""
+    """Return ``alive``, ``dead``, ``invalid``, or ``unknown`` for ownership."""
     try:
         with open(lock_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
+    except (ValueError, UnicodeError, TypeError):
+        return "invalid"
+    except OSError:
+        return "unknown"
+    try:
+        if not isinstance(payload, dict):
+            return "invalid"
+        if not isinstance(payload.get("host"), str):
+            return "invalid"
         if payload.get("host") != socket.gethostname():
             return "unknown"
         pid = int(payload.get("pid", 0))
         if pid <= 0:
-            return "unknown"
+            return "invalid"
         if pid == os.getpid():
             # Another thread in this process may legitimately own the lock.
             return "alive"
@@ -352,6 +361,8 @@ def _lock_owner_status(lock_path: str) -> str:
         except (PermissionError, OSError):
             return "unknown"
         return "alive"
+    except (ValueError, TypeError):
+        return "invalid"
     except Exception:
         return "unknown"
 
@@ -508,14 +519,17 @@ def exclusive_file_lock(
             if observed is None:
                 continue
             stale = False
+            invalid_abandoned = False
             try:
-                stale = stale_seconds >= 0 and time.time() - os.path.getmtime(lock_path) > stale_seconds
+                age = time.time() - os.path.getmtime(lock_path)
+                stale = stale_seconds >= 0 and age > stale_seconds
+                invalid_abandoned = age > 5.0
             except OSError:
                 continue
             owner_status = _lock_owner_status(lock_path)
             if owner_status == "dead" or (
                 stale and owner_status != "alive"
-            ):
+            ) or (invalid_abandoned and owner_status == "invalid"):
                 try:
                     remaining = max(
                         0.01,
@@ -532,20 +546,18 @@ def exclusive_file_lock(
                         # delete a file other than the one actually observed.
                         if _lock_observation(lock_path) == observed:
                             stale_now = False
+                            invalid_abandoned_now = False
                             try:
-                                stale_now = (
-                                    stale_seconds >= 0
-                                    and time.time()
-                                    - os.path.getmtime(lock_path)
-                                    > stale_seconds
-                                )
+                                age_now = time.time() - os.path.getmtime(lock_path)
+                                stale_now = stale_seconds >= 0 and age_now > stale_seconds
+                                invalid_abandoned_now = age_now > 5.0
                             except OSError:
                                 stale_now = False
                             owner_status_now = _lock_owner_status(lock_path)
                             if owner_status_now == "dead" or (
                                 stale_now
                                 and owner_status_now != "alive"
-                            ):
+                            ) or (invalid_abandoned_now and owner_status_now == "invalid"):
                                 os.remove(lock_path)
                                 removed = True
                     if removed:

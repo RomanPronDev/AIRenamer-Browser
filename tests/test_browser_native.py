@@ -21,7 +21,7 @@ class BrowserNativeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.project = root / "DEMO"
-        self.shots = Path(config.get_project_shot_root(str(self.project)))
+        self.shots = self.project / "vfx" / "shots"
         self.shot = self.shots / "SH010"
         self.shot.mkdir(parents=True)
         self.source = root / "download.png"
@@ -37,11 +37,51 @@ class BrowserNativeTests(unittest.TestCase):
         for patcher in self.patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.host = browser_native.BrowserHost()
+        self.host = browser_native.BrowserHost(initialize_settings=False)
         self.addCleanup(self.host.close)
 
     def target(self):
         return {"project": "DEMO", "sequence": None, "shot": "SH010"}
+
+    def test_browser_media_defaults_ignore_desktop_prefixes_and_folders(self):
+        with patch.object(config, "TARGET_PREFIX", "desktop-media"), \
+             patch.object(config, "DIR_KEYFRAME", "desktop-images"), \
+             patch.object(config, "DIR_VIDEO", "desktop-videos"):
+            image = self.host.import_file({**self.target(), "source": str(self.source)})
+            self.assertEqual(Path(image["path"]).parent, self.shot / "genai" / "KEYFRAMES")
+            self.assertTrue((self.shot / "genai" / "VIDEO").is_dir())
+            source_video = Path(self.temp.name) / "clip.mp4"
+            source_video.write_bytes(b"video")
+            video = self.host.import_file({**self.target(), "source": str(source_video)})
+            self.assertEqual(Path(video["path"]).parent, self.shot / "genai" / "VIDEO")
+            self.assertEqual(len(self.host.files(self.target())["files"]), 2)
+            self.assertFalse((self.shot / "desktop-media").exists())
+
+    def test_custom_media_defaults_and_project_overrides_control_real_imports_after_reopen(self):
+        defaults = {"scenePrefix": "vfx/shots", "shotPrefix": "", "targetPrefix": "ai-work",
+                    "imageFolder": "STILLS", "videoFolder": "CLIPS", "defaultLayout": "shots"}
+        self.host.set_default_structure(defaults)
+        image = self.host.import_file({**self.target(), "source": str(self.source)})
+        self.assertEqual(Path(image["path"]).parent, self.shot / "ai-work" / "STILLS")
+        self.assertTrue((self.shot / "ai-work" / "CLIPS").is_dir())
+        override = {**defaults, "project": "DEMO", "targetPrefix": "custom-media",
+                    "imageFolder": "CUSTOM-IMAGES", "videoFolder": "CUSTOM-VIDEO", "layout": "shots"}
+        self.host.set_project_structure(override)
+        second = browser_native.BrowserHost(initialize_settings=False)
+        try:
+            values = second.get_structure({"project": "DEMO"})
+            self.assertEqual(values["values"]["imageFolder"], "CUSTOM-IMAGES")
+            image = second.import_file({**self.target(), "source": str(self.source)})
+            self.assertEqual(Path(image["path"]).parent, self.shot / "custom-media" / "CUSTOM-IMAGES")
+            video_source = Path(self.temp.name) / "custom.mp4"
+            video_source.write_bytes(b"video")
+            video = second.import_file({**self.target(), "source": str(video_source)})
+            self.assertEqual(Path(video["path"]).parent, self.shot / "custom-media" / "CUSTOM-VIDEO")
+            self.assertFalse((self.shot / "genai").exists())
+            second.reset_project_structure({"project": "DEMO"})
+            self.assertEqual(second.get_structure({"project": "DEMO"})["values"]["imageFolder"], "STILLS")
+        finally:
+            second.close()
 
     def test_projects_navigation_files_and_real_import(self):
         projects = self.host.dispatch({"type": "projects"})["projects"]
@@ -90,6 +130,83 @@ class BrowserNativeTests(unittest.TestCase):
         with patch.object(config, "save_projects", side_effect=AssertionError("unexpected write")):
             self.assertEqual(self.host.projects()["projects"][0]["path"], original)
 
+    def test_detected_layout_is_cached_after_first_navigation(self):
+        self.host.navigation({"project": "DEMO"})
+        with patch.object(config, "detect_project_layout",
+                          side_effect=AssertionError("unexpected project scan")):
+            self.assertEqual(self.host.projects()["projects"][0]["layout"], "shots")
+            self.assertEqual(self.host.navigation({"project": "DEMO"})["shots"], ["SH010"])
+
+    def test_standard_shots_tree_detects_optional_sequences(self):
+        root = Path(self.temp.name)
+        sequenced = root / "SEQUENCED"
+        (sequenced / "vfx" / "shots" / "sep0010" / "sep0070" / "genai").mkdir(parents=True)
+        (sequenced / "vfx" / "shots" / "sep0020" / "sep0080" / "genai").mkdir(parents=True)
+        (sequenced / "vfx" / "assets").mkdir()
+        direct = root / "DIRECT"
+        (direct / "vfx" / "shots" / "neo0010" / "genai").mkdir(parents=True)
+        with patch.object(config, "get_projects", return_value={
+            "SEQUENCED": str(sequenced), "DIRECT": str(direct)}), \
+             patch.object(config, "get_project_modes", return_value={
+                 "SEQUENCED": "shots", "DIRECT": "sequences"}):
+            first = self.host.navigation({"project": "SEQUENCED"})
+            self.assertEqual(first["layout"], "sequences")
+            self.assertEqual(first["sequences"], ["sep0010", "sep0020"])
+            self.assertEqual(self.host.navigation({"project": "SEQUENCED", "sequence": "sep0010"})["shots"],
+                             ["sep0070"])
+            self.assertEqual(self.host.navigation({"project": "SEQUENCED", "sequence": "sep0020"})["shots"],
+                             ["sep0080"])
+            imported = self.host.import_file({"project": "SEQUENCED", "sequence": "sep0010",
+                                              "shot": "sep0070", "source": str(self.source)})
+            self.assertTrue(imported["path"].startswith(str(
+                sequenced / "vfx" / "shots" / "sep0010" / "sep0070" / "genai")))
+            self.assertEqual(len(self.host.files({"project": "SEQUENCED", "sequence": "sep0010",
+                                                  "shot": "sep0070"})["files"]), 1)
+            second = self.host.navigation({"project": "DIRECT"})
+            self.assertEqual(second["layout"], "shots")
+            self.assertEqual(second["shots"], ["neo0010"])
+
+    def test_project_structure_override_persists_and_changes_media_destination(self):
+        custom = self.project / "custom" / "SQ010" / "cuts" / "SH020"
+        (custom / "genai").mkdir(parents=True)
+        values = {"project": "DEMO", "scenePrefix": "custom", "shotPrefix": "cuts",
+                  "targetPrefix": "media", "imageFolder": "genai",
+                  "videoFolder": "VIDEO", "layout": "sequences"}
+        self.host.set_project_structure(values)
+        preview = self.host.get_structure({"project": "DEMO"})
+        self.assertTrue(preview["custom"])
+        self.assertEqual(preview["preview"]["sequences"], ["SQ010"])
+        self.assertEqual(preview["preview"]["examples"][0]["shots"], ["SH020"])
+        self.assertEqual(self.host.navigation({"project": "DEMO", "sequence": "SQ010"})["shots"],
+                         ["SH020"])
+        result = self.host.import_file({"project": "DEMO", "sequence": "SQ010",
+                                        "shot": "SH020", "source": str(self.source)})
+        self.assertTrue(result["path"].startswith(str(custom / "media" / "genai")))
+        self.assertTrue(Path(result["path"]).is_file())
+        another_host = browser_native.BrowserHost(initialize_settings=False)
+        try:
+            self.assertEqual(another_host.navigation({"project": "DEMO", "sequence": "SQ010"})["shots"],
+                             ["SH020"])
+        finally:
+            another_host.close()
+        self.host.reset_project_structure({"project": "DEMO"})
+        self.assertFalse(self.host.get_structure({"project": "DEMO"})["custom"])
+        self.assertEqual(self.host.navigation({"project": "DEMO"})["shots"], ["SH010"])
+
+    def test_default_structure_is_editable_and_rejects_unsafe_paths(self):
+        self.assertEqual(self.host.get_structure({})["defaults"]["scenePrefix"],
+                         os.path.join("vfx", "shots"))
+        self.host.set_default_structure({"scenePrefix": "production\\shots",
+                                         "shotPrefix": "", "targetPrefix": "",
+                                         "defaultLayout": "shots"})
+        self.assertEqual(self.host.get_structure({})["defaults"]["scenePrefix"],
+                         os.path.join("production", "shots"))
+        for invalid in ("..\\other", "X:\\other"):
+            with self.assertRaises(browser_native.HostError):
+                self.host.set_project_structure({"project": "DEMO",
+                    "scenePrefix": invalid, "shotPrefix": "", "targetPrefix": "",
+                    "layout": "shots"})
+
     def test_first_project_folder_is_saved_only_after_selection(self):
         with patch.object(config, "get_projects", return_value={}), \
              patch.object(config, "get_project_modes", return_value={}), \
@@ -107,6 +224,20 @@ class BrowserNativeTests(unittest.TestCase):
             save.assert_called_once_with({"DEMO": str(self.project)},
                                          project_modes={"DEMO": "shots"})
 
+    def test_folder_picker_returns_a_path_without_saving_it(self):
+        with patch.object(browser_native, "_choose_project_folder",
+                          return_value=str(self.project)) as picker, \
+             patch.object(config, "save_projects") as save:
+            result = self.host.dispatch({"type": "choose_project_folder",
+                                         "payload": {"initial": str(self.project)}})
+            self.assertEqual(result, {"path": str(self.project)})
+            picker.assert_called_once_with(str(self.project))
+            save.assert_not_called()
+        with patch.object(browser_native, "_choose_project_folder", return_value=""):
+            self.assertEqual(self.host.choose_project_folder({}), {"path": ""})
+        with self.assertRaises(browser_native.HostError):
+            self.host.choose_project_folder({"initial": 42})
+
     def test_drag_url_streams_validated_project_file_from_loopback(self):
         imported = self.host.import_file({**self.target(), "source": str(self.source)})
         record = self.host.files(self.target())["files"][0]
@@ -117,6 +248,18 @@ class BrowserNativeTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(record["dragUrl"] + "unknown", timeout=5)
         self.assertEqual(error.exception.code, 404)
+
+    def test_desktop_drag_uses_the_validated_local_file(self):
+        imported = self.host.import_file({**self.target(), "source": str(self.source)})
+        with patch.object(browser_native, "_launch_native_drag") as launch:
+            result = self.host.dispatch({"type": "drag_to_app", "payload": {
+                **self.target(), "category": imported["category"], "name": imported["name"]
+            }})
+            self.assertEqual(result, {"opened": True})
+            launch.assert_called_once_with(imported["path"])
+            with self.assertRaises(browser_native.HostError):
+                self.host.drag_to_app({**self.target(), "category": imported["category"],
+                                       "name": "missing.png"})
 
     def test_video_preview_streams_inline_and_supports_byte_ranges(self):
         source = Path(self.temp.name) / "clip.mp4"
@@ -279,7 +422,7 @@ class BrowserNativeTests(unittest.TestCase):
 
     def test_fix_video_name_keeps_converted_frame_sequence(self):
         video_category = next(cat for cat in config.get_media_categories() if cat.media_type == config.MEDIA_TYPE_VIDEO)
-        folder = Path(config.get_target_base(str(self.shot))) / video_category.folder
+        folder = Path(browser_native._target_root("DEMO", str(self.shot))) / video_category.folder
         folder.mkdir(parents=True)
         original = folder / "draft.mov"
         original.write_bytes(b"video")

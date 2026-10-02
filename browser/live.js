@@ -2,17 +2,19 @@
 "use strict";
 const root = document.getElementById("root");
 const state = {
-  connected: false, projects: [], categories: [], project: "", layout: "",
+  connected: false, loading: true, projects: [], categories: [], project: "", layout: "",
   sequences: [], sequence: "", shots: [], shot: "", files: [],
   recent: {downloads: [], managed: []}, tabId: null, windowId: null, query: "",
   selected: new Set(), modal: null, openMenu: null, busy: false, error: "",
   generation: 0, theme: "system", paneHeights: {shots:126,files:240}, resizing: null,
-  conversions: new Map(), setupDismissed: false,
+  subversionsEnabled:true,createSubversion:false,addFormat:false,importDestination:null,
+  mediaExtensions:['.png','.jpg','.jpeg','.tif','.tiff','.webp','.avif','.gif','.exr','.mp4','.mov','.mkv','.webm','.avi','.m4v'],
+  conversions: new Map(), setupDismissed: false, desktopDragMode: "native", nativeDragReady: false,
 };
-const mediaExt = /\.(png|jpe?g|tiff?|webp|avif|gif|exr|mp4|mov|mkv|webm|avi|m4v)$/i;
+let mediaExt = /\.(png|jpe?g|tiff?|webp|avif|gif|exr|mp4|mov|mkv|webm|avi|m4v)$/i;
 const thumbnailCache = new Map();
-const dragFileCache = new Map();
-const MAX_BROWSER_DRAG_BYTES = 128 * 1024 * 1024;
+const localFiles = typeof AIRenamerLocalFiles === "function" ? new AIRenamerLocalFiles() : null;
+const activeProject = () => state.projects.find(project => project.name === state.project);
 const esc = value => String(value ?? "").replace(/[&<>"']/g, ch =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 const q = selector => root.querySelector(selector);
@@ -28,7 +30,11 @@ async function message(kind, payload = {}) {
 }
 const native = (type, payload) => message("native", {type, payload});
 function status(error) {
-  state.error = String(error?.message || error || "");
+  const message = String(error?.message || error || "");
+  if (["settings","setup","project-path","structure","connect-files"].includes(state.modal?.kind)) {
+    state.modal.error = message;
+    state.error = "";
+  } else state.error = message;
   render();
 }
 function icon(name) {
@@ -56,11 +62,12 @@ function selectHtml(list, selected, empty) {
 }
 function fileRows() {
   if (!state.shot) return '<div class="empty">Select a shot to view its files.</div>';
-  if (!state.files.length) return '<div class="empty">No media files in this shot yet.</div>';
+  if (!state.files.length&&!state.categories.some(cat=>!['keyframes','video'].includes(cat.id))) return '<div class="empty">No media files in this shot yet.</div>';
   return state.categories.map(category => {
     const items = state.files.filter(item => item.category === category.id);
-    if (!items.length) return "";
-    return '<section class="category"><div class="section-title">'+esc(category.folder)+'<span>'+items.length+'</span></div>'+
+    if (!items.length&&['keyframes','video'].includes(category.id)) return "";
+    return '<section class="category" data-drop-category="'+esc(category.id)+'"><div class="section-title">'+esc(category.folder)+'<span>'+items.length+'</span>'+
+      '<button class="icon-button" data-action="import" data-category="'+esc(category.id)+'" aria-label="Add files to '+esc(category.folder)+'">'+icon('plus')+'</button></div>'+
       items.map(item => '<div class="file-row" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" draggable="true">'+
       '<label class="file-check"><input type="checkbox" data-select="'+esc(key(item))+'" '+(state.selected.has(key(item))?"checked":"")+' aria-label="Select '+esc(item.name)+'"></label>'+
       '<div class="file-icon">'+icon(category.mediaType==="video"?"film":"image")+'</div>'+
@@ -69,6 +76,9 @@ function fileRows() {
       (item.subversion ? ' · '+String(item.subversion).padStart(2,"0") : "")+
       (item.hasPsd?" · PSD":"")+(item.converted?" · PNG sequence":"")+
       (state.conversions.has(item.path)?" · Converting to PNG…":"")+'</div></div>'+
+      (state.desktopDragMode==='native'?
+      '<button class="icon-button shot-drag-handle" draggable="true" data-internal-drag="true" aria-label="Drag '+esc(item.name)+' to another shot" title="Drag to another shot">'+icon("move")+'</button>':
+      '<button class="icon-button" data-action="drag-to-app" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Drag '+esc(item.name)+' into a desktop app" title="Drag into desktop app">'+icon("external")+'</button>')+
       '<button class="icon-button folder-shortcut" data-action="open-folder" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Show '+esc(item.name)+' in Explorer" title="Show in Explorer">'+icon("folder")+'</button>'+
       '<button class="icon-button" data-action="file-menu" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Actions for '+esc(item.name)+'">⋯</button></div>').join("")+'</section>';
   }).join("");
@@ -136,32 +146,169 @@ function paintThumbnail(node,data){
     node.innerHTML='<img src="data:'+esc(data.mime)+';base64,'+data.data+'" alt="">';
   }
 }
+function structurePreviewHtml(preview) {
+  if(!preview)return '<p class="hint">Use Check paths to preview the folders AIRenamer will read.</p>';
+  const folder=preview.shotsRoot||preview.sequenceRoot;
+  const items=preview.shots||preview.sequences||[];
+  const count=preview.shotCount??preview.sequenceCount??0;
+  return '<div class="structure-preview"><strong>'+(preview.shotsRoot?'Shots folder':'Sequences folder')+'</strong>'+
+    '<code>'+esc(folder)+'</code><small>'+(preview.exists?count+' found':'Folder unavailable')+
+    (items.length?' · '+esc(items.slice(0,5).join(', ')):'')+'</small>'+
+    (preview.examples?.length?preview.examples.map(item=>'<small>'+esc(item.sequence)+' → '+esc(item.shotsRoot)+
+      (item.shots.length?' · '+esc(item.shots.join(', ')):' · no shots found')+'</small>').join(''):'')+'</div>';
+}
+const namingDefaults={filename_template:'{sequence}_{shot}_{type}_v{version}_{subversion}{format}',
+  image_type_suffix:'IMG',video_type_suffix:'VID',subversion_enabled:'Yes',
+  image_extensions:['.png','.jpg','.jpeg','.tiff','.webp','.avif','.gif','.exr'],
+  video_extensions:['.mp4','.mov','.mkv','.webm','.avi','.m4v'],additional_categories:[]};
+function structuredNamingDefaults(){return JSON.parse(JSON.stringify(namingDefaults));}
+function namingSettingsHtml(modal){
+  const settings=modal.settings||namingDefaults;
+  const field=(name,label)=>'<label>'+label+'<input type="text" id="setting-'+name+'" data-preference="'+name+'" spellcheck="false" value="'+esc(settings[name])+'"></label>';
+  return '<details class="settings-group" open><summary>Names & versions</summary>'+
+    field('filename_template','Filename template')+
+    '<p class="hint">Tokens: {sequence}, {scene}, {shot}, {type}, {version}, {subversion}, {format}. File extensions are added automatically.</p>'+
+    '<div class="setting-pair">'+field('image_type_suffix','Image type suffix')+field('video_type_suffix','Video type suffix')+'</div>'+
+    '<label class="setting-row">Enable subversions<input id="setting-subversion_enabled" data-preference="subversion_enabled" type="checkbox" '+(settings.subversion_enabled!=='No'?'checked':'')+'></label>'+
+    '<p class="hint">Versions use 001, 002…; subversions use 00, 01…. Drop onto a saved file to extend that version.</p>'+
+    '<div id="naming-preview" class="naming-preview" aria-live="polite">'+namingPreviewHtml(modal.preview)+'</div></details>'+
+    '<details class="settings-group"><summary>File types & categories</summary>'+
+    ['image','video'].map(kind=>'<label>'+kind[0].toUpperCase()+kind.slice(1)+' extensions<input type="text" id="setting-'+kind+'_extensions" data-preference="'+kind+'_extensions" spellcheck="false" value="'+esc(settings[kind+'_extensions'].join(', '))+'"></label>').join('')+
+    '<p class="hint">Separate extensions with commas. Additional categories share the project’s media root.</p>'+
+    (settings.additional_categories||[]).map((cat,index)=>'<div class="category-setting">'+
+      ['id','folder','type_suffix'].map(name=>'<label>'+({id:'Category ID',folder:'Folder',type_suffix:'Type suffix'}[name])+
+        '<input type="text" data-category-index="'+index+'" data-category-field="'+name+'" value="'+esc(cat[name])+'" spellcheck="false"></label>').join('')+
+      '<label>Media type<select data-category-index="'+index+'" data-category-field="media_type">'+
+        ['image','video'].map(kind=>'<option value="'+kind+'" '+(kind===cat.media_type?'selected':'')+'>'+kind+'</option>').join('')+'</select></label>'+
+      '<button class="small-action" data-action="remove-category" data-index="'+index+'">Remove category</button></div>').join('')+
+    '<button class="small-action" data-action="add-category">'+icon('plus')+' Add category</button></details>';
+}
+function namingPreviewHtml(preview){
+  if(!preview)return '<small>Edit a naming field to see an example.</small>';
+  return '<small>Main version</small><code>'+esc(preview.imageMain)+'</code><code>'+esc(preview.videoMain)+'</code>'+
+    (state.modal?.settings?.subversion_enabled!=='No'?'<small>Subversion</small><code>'+esc(preview.imageSubversion)+'</code>':'');
+}
+function namingForm(){
+  const settings={...(state.modal?.settings||namingDefaults)};
+  for(const name of ['filename_template','image_type_suffix','video_type_suffix','subversion_enabled','image_extensions','video_extensions']){
+    const input=q('#setting-'+name);if(!input)continue;
+    settings[name]=name==='subversion_enabled'?(input.checked?'Yes':'No'):
+      name.endsWith('_extensions')?input.value.split(/[\s,;]+/).filter(Boolean):input.value.trim();
+  }
+  settings.additional_categories=(settings.additional_categories||[]).map(cat=>({...cat}));
+  for(const input of root.querySelectorAll('[data-category-field]'))
+    settings.additional_categories[Number(input.dataset.categoryIndex)][input.dataset.categoryField]=input.value.trim();
+  return settings;
+}
+function applyPreferences(data){
+  const settings=data.settings;
+  state.subversionsEnabled=settings?settings.subversion_enabled!=='No':data.subversionsEnabled??state.subversionsEnabled;
+  if(!state.subversionsEnabled)state.createSubversion=false;
+  const extensions=settings?[...settings.image_extensions,...settings.video_extensions]:
+    data.imageExtensions&&data.videoExtensions?[...data.imageExtensions,...data.videoExtensions]:null;
+  if(extensions)state.mediaExtensions=extensions;
+  if(extensions)mediaExt=new RegExp('(?:'+extensions.map(ext=>ext.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')+')$','i');
+}
+function importOptions(shift=false){return {subversion:state.subversionsEnabled&&(state.createSubversion||shift),addFormat:state.addFormat};}
+let namingPreviewTimer=null;
+let namingPreviewGeneration=0;
+function scheduleNamingPreview(){
+  clearTimeout(namingPreviewTimer);
+  const modal=state.modal;if(modal?.kind!=='settings')return;
+  modal.settings=namingForm();const generation=++namingPreviewGeneration;
+  namingPreviewTimer=setTimeout(async()=>{
+    try{
+      const preview=await native('preview_naming',{settings:modal.settings,sequence:state.sequence||'',shot:state.shot||'SH010'});
+      if(state.modal!==modal||generation!==namingPreviewGeneration)return;
+      modal.preview=preview;const node=q('#naming-preview');if(node)node.innerHTML=namingPreviewHtml(preview);
+    }catch(error){
+      if(state.modal!==modal||generation!==namingPreviewGeneration)return;
+      const node=q('#naming-preview');if(node)node.innerHTML='<small class="field-error">'+esc(error.message||error)+'</small>';
+    }
+  },250);
+}
 function modalHtml() {
   if (!state.modal) return "";
   const modal = state.modal;
-  const heading = modal.kind==="settings"?"Settings":modal.kind==="setup"?"Choose a project folder":
+  const heading = modal.kind==="settings"?"Settings":modal.kind==="setup"?"Add your first project":
+    modal.kind==="project-path"?(modal.project?"Change project folder":"Add project folder"):
+    modal.kind==="connect-files"?"Connect folder for drag":
+    modal.kind==="structure"?(modal.project?"Project structure":"Default structure"):
     modal.kind==="remove-project"?"Remove project shortcut":modal.kind==="preview"?"Preview":
     modal.kind==="move"?(modal.items?.length>1?"Move "+modal.items.length+" files":"Move file"):"File actions";
   let body = "";
+  const projectPathField = '<label>Project folder path<div class="project-path-row">'+
+    '<input id="project-folder-input" type="text" spellcheck="false" autocomplete="off" placeholder="D:\\Projects\\MyProject" value="'+esc(modal.path||"")+'">'+
+    '<button class="small-action" data-action="browse-project-folder" type="button" '+(modal.browsing||modal.busy?'disabled':'')+'>'+(modal.browsing?'Opening…':'Browse…')+'</button></div></label>';
   if (modal.kind==="settings") {
     body = '<div class="settings-section"><div class="section-title">PROJECT FOLDERS</div>'+
-      (state.projects.length?state.projects.map(project=>
+      (state.projects.length?state.projects.map(project=>{
+        const nested=project.path.match(/[\\/]vfx[\\/]shots[\\/]?$/i);
+        const suggestedRoot=nested?project.path.slice(0,-nested[0].length):"";
+        return (
         '<div class="project-setting"><div class="project-setting-info"><strong>'+esc(project.name)+'</strong><span title="'+esc(project.path)+'">'+esc(project.path)+'</span>'+
         '<small>'+esc(project.layout==="sequences"?'Sequences → Shots':'Shots directly')+(project.available?'':' · Folder unavailable')+'</small></div>'+
-        '<div class="project-setting-actions"><button data-action="change-project-path" data-project="'+esc(project.name)+'">Change folder</button>'+
-        '<button data-action="ask-remove-project" data-project="'+esc(project.name)+'" aria-label="Remove '+esc(project.name)+' shortcut">Remove</button></div></div>').join(''):
-        '<p class="hint">Choose a project root folder to start. For example: D:\\Projects\\MyProject.</p>')+
-      '<button class="small-action" data-action="add-project">'+icon("plus")+' Add project folder</button></div>'+
+        (suggestedRoot?'<small class="structure-warning">This is a shots folder. Select the project root: '+esc(suggestedRoot)+'</small>':'')+
+        '<div class="project-setting-actions"><button data-action="edit-project-structure" data-project="'+esc(project.name)+'">Structure</button>'+
+        (suggestedRoot?'<button data-action="repair-project-root" data-project="'+esc(project.name)+'" data-root="'+esc(suggestedRoot)+'">Fix project root</button>':'')+
+        '<button data-action="connect-files" data-project="'+esc(project.name)+'">Connect for drag</button>'+
+        '<button data-action="change-project-path" data-project="'+esc(project.name)+'">Change folder</button>'+
+        '<button data-action="ask-remove-project" data-project="'+esc(project.name)+'" aria-label="Remove '+esc(project.name)+' shortcut">Remove</button></div></div>');
+      }).join(''):
+        '<p class="hint">Paste a project root folder path copied from Explorer.</p>')+
+      '<button class="small-action" data-action="new-project-path">'+icon("plus")+' Add project folder</button></div>'+
+      '<div class="settings-section"><div class="section-title">FOLDER STRUCTURE</div>'+
+      '<p class="hint">Default shots tree: Project / vfx / shots / [Sequence] / Shot</p>'+
+      '<p class="hint">Browser settings are independent. Default media folders: Shot / genai / KEYFRAMES and Shot / genai / VIDEO.</p>'+
+      '<button class="small-action" data-action="edit-default-structure">Edit default folders</button></div>'+
+      namingSettingsHtml(modal)+
+      '<label>Desktop file drag<select id="desktop-drag-setting">'+
+      '<option value="native" '+((modal.dragMode||state.desktopDragMode)==='native'?'selected':'')+'>Native drag (default)</option>'+
+      '<option value="browser" '+((modal.dragMode||state.desktopDragMode)==='browser'?'selected':'')+'>Chrome folder connection</option></select></label>'+
+      '<p class="hint">Drag a file row directly into an app. Native drag starts automatically and needs no folder connection. Use the move handle beside a file to drag it to another shot. The file menu retains the fallback drag window.</p>'+
+      '<button class="small-action" data-action="drag-probe">Open drag test target</button>'+
       '<label>Theme<select id="theme-setting">'+
       ['system','light','dark'].map(value=>'<option value="'+value+'" '+(state.theme===value?'selected':'')+'>'+value[0].toUpperCase()+value.slice(1)+'</option>').join('')+
       '</select></label><label>Ignored folder names<textarea id="ignored-names" rows="3" spellcheck="false" placeholder="One name per line">'+
       esc((modal.ignoredNames||[]).filter(name=>name.toLowerCase()!=="_shotcode").join("\n"))+
       '</textarea></label><p class="hint">_shotcode is always ignored. Add one folder name per line.</p>'+
-      '<button class="primary wide" data-action="save-settings">Save settings</button>';
+      '<button class="primary wide" data-action="save-settings" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Saving…':'Save settings')+'</button>';
+  } else if (modal.kind==="connect-files") {
+    const project=state.projects.find(item=>item.name===modal.project);
+    body='<p>Experimental direct file drag from this Chrome panel.</p>'+
+      '<div class="folder-connect" data-connect-folder="'+esc(modal.project)+'"><strong>Drop the project folder here</strong><code>'+esc(project?.path)+'</code></div>'+
+      '<p class="hint">Drag the root folder from Explorer. Files stay on disk; only the file under your pointer is prepared. Reconnect after closing this panel.</p>'+
+      (localFiles?.connected(project)?'<p class="hint">Connected for this panel session.</p>':'')+
+      '<button class="small-action" data-action="open-project-folder" data-project="'+esc(modal.project)+'">Show project folder in Explorer</button>';
   } else if (modal.kind==="setup") {
-    body = '<p>Select the root folder of one project, for example <code>D:\\Projects\\MyProject</code>. AIRenamer will detect whether it contains sequences or shots.</p>'+
-      '<button class="primary wide" data-action="add-project">'+icon("folder")+' Choose project folder</button>'+
+    body = '<p>Choose a project root folder, or paste its path from Explorer.</p>'+
+      projectPathField+
+      '<button class="primary wide" data-action="save-project-path" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Adding project…':'Add project')+'</button>'+
       '<p class="hint">You can add more project folders later in Settings.</p>';
+  } else if (modal.kind==="project-path") {
+    body = '<p>'+esc(modal.project?"Choose a new root folder for "+modal.project+", or paste its path.":"Choose a project root folder, or paste its path from Explorer.")+'</p>'+
+      projectPathField+
+      '<p class="hint">The folder must already exist. AIRenamer will detect its sequences and shots.</p>'+
+      '<button class="primary wide" data-action="save-project-path" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Saving…':modal.project?'Save folder path':'Add project')+'</button>';
+  } else if (modal.kind==="structure") {
+    const values=modal.values;
+    const layoutKey=modal.project?'layout':'defaultLayout';
+    body='<p>'+(modal.project?'Set this project’s shots tree and layout.':'Defaults for projects without a custom structure.')+'</p>'+
+      (modal.project?'<p class="structure-root">Project root<br><code>'+esc(modal.projectRoot)+'</code></p>':'')+
+      '<label>Layout<select id="structure-layout">'+
+      (modal.project?'':'<option value="auto" '+(values.defaultLayout==='auto'?'selected':'')+'>Detect automatically</option>')+
+      '<option value="sequences" '+(values[layoutKey]==='sequences'?'selected':'')+'>Sequences → Shots</option>'+
+      '<option value="shots" '+(values[layoutKey]==='shots'?'selected':'')+'>Shots directly</option></select></label>'+
+      '<label>Shots tree folder inside project<input id="structure-scene" type="text" spellcheck="false" placeholder="vfx\\shots" value="'+esc(values.scenePrefix)+'"></label>'+
+      '<label>Extra folder inside each sequence (optional)<input id="structure-shot" type="text" spellcheck="false" placeholder="Leave empty" value="'+esc(values.shotPrefix)+'"></label>'+
+      '<label>Media folder inside each shot (optional)<input id="structure-target" type="text" spellcheck="false" placeholder="Leave empty" value="'+esc(values.targetPrefix)+'"></label>'+
+      '<label>Images folder<input id="structure-image" type="text" spellcheck="false" placeholder="KEYFRAMES" value="'+esc(values.imageFolder)+'"></label>'+
+      '<label>Videos folder<input id="structure-video" type="text" spellcheck="false" placeholder="VIDEO" value="'+esc(values.videoFolder)+'"></label>'+
+      '<button class="small-action" data-action="standard-media-folders">Use genai / KEYFRAMES and VIDEO</button>'+
+      '<p class="hint">With sequences: Project / vfx / shots / 45 / ham0010. Direct shots: Project / vfx / shots / neo0010. Paths must be relative to their parent folder.</p>'+
+      (modal.project?structurePreviewHtml(modal.preview)+'<button class="small-action" data-action="check-structure" '+(modal.busy?'disabled':'')+'>Check paths</button>':'')+
+      '<button class="primary wide" data-action="save-structure" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Saving…':'Save structure')+'</button>'+
+      (modal.project&&modal.custom?'<button class="small-action reset-structure" data-action="reset-project-structure" '+(modal.busy?'disabled':'')+'>Use default structure</button>':'');
   } else if (modal.kind==="remove-project") {
     body = '<p>Remove <strong>'+esc(modal.project)+'</strong> from AIRenamer? Its folder and files will stay on disk.</p>'+
       '<button class="primary wide" data-action="confirm-remove-project">Remove shortcut</button>';
@@ -187,12 +334,14 @@ function modalHtml() {
       (conversion?"":'<button class="menu-action" data-action="move" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("move")+'Move to another shot</button>')+
       (video&&!file?.converted&&!conversion?'<button class="menu-action" data-action="convert-png" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("image")+'Convert to PNG</button>':"")+
       (conversion?'<button class="menu-action" data-action="cancel-conversion" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("close")+'Cancel conversion</button>':"")+
+      '<button class="menu-action" data-action="drag-to-app" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("external")+'Drag into desktop app</button>'+
       '<button class="menu-action" data-action="copy-path" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("copy")+'Copy file path</button>'+
       (file?.converted?'<button class="menu-action" data-action="copy-sequence-path" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("copy")+'Copy PNG sequence folder</button>':"") +
       (file?.converted?'<button class="menu-action" data-action="show-sequence-folder" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("folder")+'Show PNG sequence folder</button>':"") +
       '<button class="menu-action" data-action="open-folder" data-category="'+esc(modal.category)+'" data-name="'+esc(modal.name)+'">'+icon("folder")+'Show file in folder</button>';
   }
-  return '<div class="overlay"><div class="dialog" role="dialog" aria-modal="true" aria-label="'+heading+'"><header><h2>'+heading+'</h2><button class="icon-button" data-action="close" aria-label="Close">'+icon("close")+'</button></header><div class="dialog-body">'+body+'</div></div></div>';
+  return '<div class="overlay"><div class="dialog" role="dialog" aria-modal="true" aria-label="'+heading+'"><header><h2>'+heading+'</h2><button class="icon-button" data-action="close" aria-label="Close">'+icon("close")+'</button></header><div class="dialog-body">'+
+    (modal.error?'<div class="dialog-error" role="alert">'+esc(modal.error)+'</div>':'')+body+'</div></div></div>';
 }
 function navigationHtml() {
   const projectItems = state.projects.map(project =>
@@ -213,7 +362,7 @@ function navigationHtml() {
   return '<section class="navigation"><div class="nav-pickers">'+projects+sequences+'</div>'+
     (state.project?'<div class="shot-tools"><span>SHOTS <b>'+state.shots.length+'</b></span><div class="search">'+icon("search")+'<input id="shot-search" type="search" placeholder="Find shot" aria-label="Find shot" value="'+esc(state.query)+'"></div></div>'+
       '<div class="shots">'+(shots||'<div class="shot-empty">'+(state.query?'No shots match this search. <button data-action="clear-shot-search">Clear search</button>':(state.layout==="sequences"&&!state.sequence?'Select a sequence to view shots.':'No shots in this location.'))+'</div>')+'</div>':"")+
-    (!state.projects.length?'<div class="empty compact">Choose a project folder in Settings.</div>':"")+
+    (!state.projects.length&&!state.loading?'<div class="empty compact">Choose a project folder in Settings.</div>':"")+
     '</section>';
 }
 function render() {
@@ -221,22 +370,28 @@ function render() {
   document.documentElement.dataset.theme=state.theme==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":state.theme;
   root.innerHTML = '<main class="app" style="--shots-height:'+state.paneHeights.shots+'px;--files-height:'+state.paneHeights.files+'px">'+
     '<header class="app-header"><div class="brand"><img src="assets/mark.svg" alt=""><strong>AIRenamer</strong></div>'+
-    '<div class="header-actions"><span class="version">'+esc(chrome.runtime.getManifest().version)+'</span><span class="host-dot '+(state.connected?"ready":"offline")+'" title="'+(state.connected?"Connected":"Disconnected")+'"></span><button class="icon-button" data-action="settings" aria-label="Settings">'+icon("settings")+'</button></div></header>'+
-    (!state.connected?'<div class="connection offline"><span class="dot"></span>Local companion is not connected<button data-action="refresh" aria-label="Refresh">'+icon("refresh")+'</button></div>':"")+
+    '<div class="header-actions"><span class="version">'+esc(chrome.runtime.getManifest().version)+'</span><span class="host-dot '+(state.connected?"ready":"offline")+'" title="'+(state.loading?"Loading":state.connected?"Connected":"Disconnected")+'"></span><button class="icon-button" data-action="settings" aria-label="Settings">'+icon("settings")+'</button></div></header>'+
+    (state.loading?'<div class="connection loading" role="status"><span>Loading</span><span class="loading-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>':
+    !state.connected?'<div class="connection offline"><span class="dot"></span>Connection unavailable<button data-action="refresh" aria-label="Refresh">'+icon("refresh")+'</button></div>':"")+
     (state.error?'<div class="error" role="alert">'+icon("alert")+'<span>'+esc(state.error)+'</span><button data-action="dismiss" aria-label="Dismiss error">×</button></div>':"")+
     navigationHtml()+'<div class="pane-handle" data-resize="shots" role="separator" aria-label="Resize Shots" title="Drag to resize Shots"></div>'+
     (state.shot?'<section class="files"><div class="section-title">FILES <span>'+state.files.length+'</span>'+
     '<button class="icon-button" data-action="refresh-files" aria-label="Refresh files">'+icon("refresh")+'</button>'+
     '<button class="icon-button inline-import" data-action="import" aria-label="Add files to '+esc(state.shot)+'" title="Add files">'+icon("plus")+'</button></div>'+
+    '<button class="drag-connection" data-action="'+(state.desktopDragMode==='native'?'settings':'connect-files')+'" data-project="'+esc(state.project)+'">'+
+    (state.desktopDragMode==='native'?(state.nativeDragReady?'Drag a file into an app · Move handle for shots':'Preparing native drag…'):
+    localFiles?.connected(activeProject())?'Folder connected · hover a file, then drag':'Connect folder for direct drag · Experimental')+'</button>'+
     (state.selected.size?'<div class="selection"><span>'+state.selected.size+' selected</span><div class="selection-actions">'+
       '<button data-action="batch-rename" '+(state.busy?"disabled":"")+'>Fix names</button>'+
       '<button data-action="batch-move" '+(state.busy?"disabled":"")+'>Move</button>'+
       '<button data-action="clear-selection" '+(state.busy?"disabled":"")+'>Clear</button></div></div>':"")+
+    '<div class="import-options">'+(state.subversionsEnabled?'<label><input id="create-subversion" type="checkbox" '+(state.createSubversion?'checked':'')+'> Create subversion</label>':'')+
+    '<label><input id="add-format" type="checkbox" '+(state.addFormat?'checked':'')+'> Add aspect ratio</label></div>'+
     '<div class="file-list">'+fileRows()+'</div></section><div class="pane-handle" data-resize="files" role="separator" aria-label="Resize Files and Recent Downloads" title="Drag to resize Files and Recent Downloads"></div>':"")+
     '<section class="recent '+(!state.shot?'fill':'')+'">'+
     '<div class="recent-heading"><strong>RECENT DOWNLOADS <span>'+recent.count+'</span></strong></div>'+
     '<div class="recent-list">'+recent.html+'</div></section>'+
-    '<input type="file" id="file-picker" multiple accept=".png,.jpg,.jpeg,.tiff,.webp,.avif,.gif,.exr,.mp4,.mov,.mkv,.webm,.avi,.m4v" hidden>'+
+    '<input type="file" id="file-picker" multiple accept="'+esc(state.mediaExtensions.join(','))+'" hidden>'+
     modalHtml()+'</main>';
   paintCachedThumbnails();
 }
@@ -244,37 +399,76 @@ function fileForRow(row) {
   return state.files.find(file=>file.category===row.dataset.category&&file.name===row.dataset.name);
 }
 function prepareBrowserDrag(item) {
-  if(!item?.dragUrl||item.size>MAX_BROWSER_DRAG_BYTES)return;
-  const key=item.path+":"+item.modified;
-  if(dragFileCache.has(key))return;
-  const pending=fetch(item.dragUrl).then(response=>{
-    if(!response.ok)throw new Error("File unavailable");
-    return response.blob();
-  }).then(blob=>{
-    const file=new File([blob],item.name,{type:blob.type||"application/octet-stream"});
-    dragFileCache.set(key,file);
-    return file;
+  if(state.desktopDragMode==='native'){
+    if(!state.nativeDragReady)warmNativeDrag();
+  }
+  const project=activeProject();
+  if(!project||!localFiles||!item)return;
+  localFiles.prepare(project,item).then(file=>{
+    if(!file)return;
+    root.querySelectorAll('.file-row').forEach(row=>{
+      if(row.dataset.category===item.category&&row.dataset.name===item.name){
+        row.dataset.localDrag='ready';row.title='Local file ready to drag';
+      }
+    });
+  }).catch(error=>{
+    root.querySelectorAll('.file-row').forEach(row=>{
+      if(row.dataset.category===item.category&&row.dataset.name===item.name)row.title=String(error.message||error);
+    });
   });
-  dragFileCache.set(key,pending);
-  pending.catch(()=>dragFileCache.delete(key));
-  if(dragFileCache.size>2)dragFileCache.delete(dragFileCache.keys().next().value);
 }
-async function refreshProjects({quiet=false}={}) {
+let warmingNativeDrag = null;
+let latestNativeDragId = null;
+function watchNativeDrop(id) {
+  if(!id)return;
+  latestNativeDragId=id;
+  const started=Date.now();
+  const poll=async()=>{
+    if(latestNativeDragId!==id||Date.now()-started>120000)return;
+    try{
+      const result=await native('drag_status',{});
+      if(latestNativeDragId!==id)return;
+      if(result.id===id&&result.phase==='finished'){
+        latestNativeDragId=null;
+        if(!result.ok)status(result.error||'File drag failed. Please try again.');
+        else if(result.effect==='None')status('The drop was cancelled or the destination did not accept this file. Drop onto the app’s file import area.');
+        return;
+      }
+      setTimeout(poll,400);
+    }catch(error){latestNativeDragId=null;state.nativeDragReady=false;status(error);}
+  };
+  setTimeout(poll,200);
+}
+function warmNativeDrag() {
+  if(warmingNativeDrag)return warmingNativeDrag;
+  warmingNativeDrag=native('drag_prepare',{}).then(()=>{
+    state.nativeDragReady=true;
+    const button=q('.drag-connection');
+    if(button&&state.desktopDragMode==='native')button.textContent='Drag a file into an app · Move handle for shots';
+  }).catch(error=>{state.nativeDragReady=false;status(error);})
+    .finally(()=>{warmingNativeDrag=null;});
+  return warmingNativeDrag;
+}
+async function refreshProjects({quiet=false,throwOnError=false}={}) {
   state.projectsLoading=(state.projectsLoading||0)+1;
+  if(!state.connected){state.loading=true;render();}
   const token=++state.generation;
   try {
     const data=await native("projects");
     if(token!==state.generation)return;
-    state.connected=true;state.error="";
+    state.connected=true;state.loading=false;state.error="";
     state.projects=data.projects;state.categories=data.categories;
+    if(data.preferences)applyPreferences(data.preferences);
     if(!state.projects.some(p=>p.name===state.project)){state.project="";state.sequence="";state.shot="";state.files=[];}
     if(!state.projects.length&&!state.modal&&!state.setupDismissed)state.modal={kind:"setup"};
     render();
     if(state.project)await refreshNavigation();
   } catch(error) {
     if(token!==state.generation)return;
-    state.connected=false;
-    if(!quiet)status(error);
+    state.connected=false;state.loading=false;
+    if(!quiet&&!throwOnError)status(error);
+    else render();
+    if(throwOnError)throw error;
   } finally {
     state.projectsLoading--;
   }
@@ -285,6 +479,9 @@ async function refreshNavigation() {
     const initial=await native("navigation",{project:state.project});
     if(token!==state.generation)return;
     state.layout=initial.layout;state.sequences=initial.sequences;
+    if(initial.categories)state.categories=initial.categories;
+    const project=state.projects.find(item=>item.name===state.project);
+    if(project)project.layout=initial.layout;
     if(initial.layout==="sequences") {
       if(!state.sequences.includes(state.sequence)){state.sequence="";state.shot="";}
       if(!state.sequence&&state.sequences.length===1){
@@ -348,7 +545,7 @@ async function chooseShot(shot) {
   render();await refreshFiles();
 }
 function setBusy(value){state.busy=value;render();}
-async function transferFile(file, destination=currentDestination()) {
+async function transferFile(file, destination={...currentDestination(),...importOptions()}) {
   if(!destination)throw new Error("Select a shot first");
   const started=await native("transfer_begin",{...destination,name:file.name});
   let transferId=started.transferId;
@@ -372,6 +569,7 @@ async function importFiles(files, destination=currentDestination()) {
   if(state.busy)return;
   try{
     setBusy(true);
+    destination={...destination,...importOptions(),...destination};
     const chosen=[...files].filter(file=>mediaExt.test(file.name));
     if(chosen.length!==files.length)throw new Error("Some files use an unsupported format");
     for(const file of chosen)await transferFile(file,destination);
@@ -382,7 +580,16 @@ async function importFiles(files, destination=currentDestination()) {
 async function openSettings() {
   state.openMenu=null;
   const data=await native("preferences");
-  state.modal={kind:"settings",ignoredNames:data.ignoredNames};render();
+  applyPreferences(data);
+  state.modal={kind:"settings",ignoredNames:data.ignoredNames,settings:data.settings||structuredNamingDefaults(),preview:data.preview};render();
+}
+function structureForm() {
+  return {scenePrefix:q('#structure-scene').value.trim(),
+    shotPrefix:q('#structure-shot').value.trim(),
+    targetPrefix:q('#structure-target').value.trim(),
+    imageFolder:q('#structure-image').value.trim(),
+    videoFolder:q('#structure-video').value.trim(),
+    layout:q('#structure-layout').value};
 }
 async function showPreview(category,name) {
   try {
@@ -451,25 +658,92 @@ root.addEventListener("click",async event=>{
     else if(action==="toggle-sequences"){state.openMenu=state.openMenu==="sequence"?null:"sequence";render();}
     else if(action==="select-project")await selectProject(button.dataset.project);
     else if(action==="select-sequence")await selectSequence(button.dataset.sequence);
-    else if(action==="add-project"){
-      state.openMenu=null;
-      const fromSettings=state.modal?.kind==="settings";
-      const result=await native("add_project");
-      if(!result.cancelled){
-        state.modal=null;
-        await refreshProjects();
-        await selectProject(result.name);
-        if(fromSettings)await openSettings();
-      }
+    else if(action==="new-project-path"){
+      state.modal={kind:"project-path",path:""};render();
     }
     else if(action==="change-project-path"){
-      const result=await native("change_project_path",{project:button.dataset.project});
-      if(!result.cancelled){
-        const wasSelected=state.project===button.dataset.project;
+      const project=state.projects.find(item=>item.name===button.dataset.project);
+      if(!project)throw new Error("Project is unavailable");
+      state.modal={kind:"project-path",project:project.name,path:project.path};render();
+    }
+    else if(action==="repair-project-root"){
+      state.modal={kind:"project-path",project:button.dataset.project,path:button.dataset.root};render();
+    }
+    else if(action==="edit-default-structure"){
+      const data=await native("get_structure",{});
+      state.modal={kind:"structure",values:data.defaults};render();
+    }
+    else if(action==="edit-project-structure"){
+      const project=button.dataset.project;
+      const data=await native("get_structure",{project});
+      state.modal={kind:"structure",project,projectRoot:data.projectRoot,
+        values:data.values,preview:data.preview,custom:data.custom};render();
+    }
+    else if(action==="check-structure"){
+      const modal=state.modal;if(!modal?.project||modal.busy)return;
+      const values=structureForm();modal.values={...values};modal.error="";modal.busy=true;render();
+      try{modal.preview=await native("preview_structure",{project:modal.project,...values});}
+      finally{if(state.modal===modal){modal.busy=false;render();}}
+    }
+    else if(action==="save-structure"){
+      const modal=state.modal;if(!modal||modal.busy)return;
+      const values=structureForm();modal.values=modal.project?{...values}:{...values,defaultLayout:values.layout};
+      modal.error="";modal.busy=true;render();
+      try{
+        if(modal.project)await native("set_project_structure",{project:modal.project,...values});
+        else await native("set_default_structure",{...values,defaultLayout:values.layout});
         state.modal=null;
-        await refreshProjects();
-        if(wasSelected)await selectProject(result.name);
+        await refreshProjects({throwOnError:true});
         await openSettings();
+      }finally{if(state.modal===modal){modal.busy=false;render();}}
+    }
+    else if(action==="standard-media-folders"){
+      if(state.modal?.kind!=='structure'||state.modal.busy)return;
+      state.modal.values={...structureForm(),targetPrefix:'genai',imageFolder:'KEYFRAMES',videoFolder:'VIDEO'};
+      state.modal.preview=null;state.modal.error='';render();
+    }
+    else if(action==="reset-project-structure"){
+      const modal=state.modal;if(!modal?.project||modal.busy)return;
+      modal.busy=true;render();
+      try{
+        await native("reset_project_structure",{project:modal.project});
+        state.modal=null;await refreshProjects({throwOnError:true});await openSettings();
+      }finally{if(state.modal===modal){modal.busy=false;render();}}
+    }
+    else if(action==="browse-project-folder"){
+      const modal=state.modal;
+      if(!modal||!(modal.kind==="setup"||modal.kind==="project-path"))return;
+      if(modal.busy)return;
+      modal.path=q("#project-folder-input")?.value||modal.path||"";
+      modal.error="";
+      modal.browsing=true;render();
+      try{
+        const selected=await native("choose_project_folder",{initial:modal.path});
+        if(state.modal===modal&&selected.path)modal.path=selected.path;
+      }finally{
+        if(state.modal===modal){modal.browsing=false;render();}
+      }
+    }
+    else if(action==="save-project-path"){
+      const modal=state.modal;
+      if(!modal||modal.busy)return;
+      const folder=q("#project-folder-input")?.value.trim().replace(/^"(.*)"$/, "$1").trim();
+      if(!folder)throw new Error("Enter a project folder path");
+      modal.path=folder;modal.error="";modal.busy=true;render();
+      try{
+        const previous=modal.project;
+        const wasSelected=state.project===previous;
+        const result=previous?
+          await native("change_project_path",{project:previous,path:folder}):
+          await native("add_project",{path:folder});
+        await refreshProjects({throwOnError:true});
+        if(!state.projects.some(project=>project.name===result.name&&project.path===result.path))
+          throw new Error("The project was saved but could not be found. Try Refresh.");
+        state.modal=null;
+        if(!previous||wasSelected)await selectProject(result.name);
+        if(modal.kind==="project-path")await openSettings();
+      }finally{
+        if(state.modal===modal){modal.busy=false;render();}
       }
     }
     else if(action==="ask-remove-project"){
@@ -486,15 +760,45 @@ root.addEventListener("click",async event=>{
     }
     else if(action==="shot")await chooseShot(button.dataset.shot);
     else if(action==="clear-shot-search"){state.query="";render();q("#shot-search")?.focus();}
-    else if(action==="import")q("#file-picker").click();
+    else if(action==="import"){
+      state.importDestination={...currentDestination(),...importOptions(),...(button.dataset.category?{category:button.dataset.category}:{})};
+      q("#file-picker").click();
+    }
+    else if(action==="connect-files"){
+      state.modal={kind:"connect-files",project:button.dataset.project||state.project};render();
+    }
+    else if(action==="drag-probe"){
+      await native('drag_probe',{});state.modal=null;render();
+    }
+    else if(action==="open-project-folder"){
+      await native("open_folder",{project:button.dataset.project});
+    }
     else if(action==="settings")await openSettings();
+    else if(action==='add-category'||action==='remove-category'){
+      const modal=state.modal;if(modal?.kind!=='settings')return;
+      modal.settings=namingForm();
+      modal.theme=q('#theme-setting')?.value||state.theme;modal.dragMode=q('#desktop-drag-setting')?.value||state.desktopDragMode;
+      modal.ignoredNames=q('#ignored-names')?.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean)||modal.ignoredNames;
+      if(action==='add-category')modal.settings.additional_categories.push({id:'',folder:'',media_type:'image',type_suffix:''});
+      else modal.settings.additional_categories.splice(Number(button.dataset.index),1);
+      render();
+    }
     else if(action==="save-settings"){
-      const names=q("#ignored-names").value.split(/[\n,]+/).map(item=>item.trim()).filter(Boolean);
-      const ignored=await native("set_ignored_names",{names});
-      state.theme=q("#theme-setting").value;
-      await chrome.storage.local.set({panelTheme:state.theme});
-      state.modal=null;render();
-      if(state.project)await refreshNavigation();
+      const modal=state.modal;if(modal?.busy)return;
+      const settings=namingForm();modal.settings=settings;modal.error='';
+      const names=q("#ignored-names").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+      const theme=q('#theme-setting').value;
+      const dragMode=q('#desktop-drag-setting')?.value||state.desktopDragMode;
+      modal.ignoredNames=names;modal.theme=theme;modal.dragMode=dragMode;modal.busy=true;render();
+      try{
+        const data=await native('set_preferences',{settings,names});applyPreferences(data);
+        const previousDragMode=state.desktopDragMode;state.desktopDragMode=dragMode;state.theme=theme;
+        await chrome.storage.local.set({panelTheme:theme,desktopDragMode:dragMode,desktopDragModeRevision:1});
+        state.modal=null;render();
+        if(dragMode==='native')await warmNativeDrag();
+        else if(previousDragMode==='native'){state.nativeDragReady=false;await native('drag_stop',{});}
+        await refreshProjects();
+      }finally{modal.busy=false;}
     }
     else if(action==="close"){
       if(state.modal?.kind==="setup")state.setupDismissed=true;
@@ -566,6 +870,10 @@ root.addEventListener("click",async event=>{
       await native("open_folder",{...currentDestination(),category:button.dataset.category,file:button.dataset.name});
       state.modal=null;render();
     }
+    else if(action==="drag-to-app"){
+      await native("drag_to_app",{...currentDestination(),category:button.dataset.category,name:button.dataset.name});
+      state.modal=null;render();
+    }
     else if(action==="rename"){
       await native("rename_file",{...currentDestination(),category:button.dataset.category,name:button.dataset.name});
       state.modal=null;await refreshFiles();
@@ -604,15 +912,18 @@ root.addEventListener("click",async event=>{
     else if(action==="assign-download"){
       const item=state.recent.downloads.find(x=>x.id===Number(button.dataset.id));
       if(!item||item.state!=="complete")throw new Error("Download is unavailable");
-      await native("import_file",{...currentDestination(),source:item.filename});
+      await native("import_file",{...currentDestination(),source:item.filename,...importOptions()});
       await refreshFiles();
     }
   }catch(error){status(error);}
 });
 root.addEventListener("change",async event=>{
   try{
-    if(event.target.id==="file-picker"){
-      const files=[...event.target.files];event.target.value="";await importFiles(files);
+    if(event.target.id==='create-subversion'){state.createSubversion=event.target.checked;}
+    else if(event.target.id==='add-format'){state.addFormat=event.target.checked;}
+    else if(event.target.dataset.preference||event.target.dataset.categoryField){scheduleNamingPreview();}
+    else if(event.target.id==="file-picker"){
+      const files=[...event.target.files];event.target.value="";const destination=state.importDestination||currentDestination();state.importDestination=null;await importFiles(files,destination);
     }
     else if(event.target.dataset.select!==undefined){
       if(event.target.checked)state.selected.add(event.target.dataset.select);
@@ -623,6 +934,12 @@ root.addEventListener("change",async event=>{
   }catch(error){status(error);}
 });
 root.addEventListener("input",event=>{
+  if(event.target.dataset.preference||event.target.dataset.categoryField){scheduleNamingPreview();return;}
+  if(event.target.id==="project-folder-input"&&state.modal){
+    state.modal.path=event.target.value;
+    state.modal.error="";
+    return;
+  }
   if(event.target.id==="shot-search"){
     state.query=event.target.value;
     const value=event.target.value;
@@ -636,18 +953,32 @@ root.addEventListener("dragstart",event=>{
   if(!item)return;
   const path=item.dragPath || item.path;
   if(!path)return;
+  if(state.desktopDragMode==='native'&&!event.target.closest('[data-internal-drag]')&&!event.shiftKey){
+    // Cancel Chromium's drag loop before the companion starts its STA/OLE loop.
+    // The companion also checks expiry and the physical left button state.
+    event.preventDefault();
+    if(!state.nativeDragReady){warmNativeDrag();status('Native drag is preparing. Hover the file, then try again.');return;}
+    native('drag_direct',{...currentDestination(),category:item.category,name:item.name,
+      fileToken:item.nativeDragToken,issued:Date.now()}).then(result=>watchNativeDrop(result.id)).catch(error=>{
+        state.nativeDragReady=false;status(error);
+    });
+    return;
+  }
   event.dataTransfer.setData("application/x-airenamer-file",JSON.stringify({
     project:state.project,sequence:state.sequence||null,shot:state.shot,
     category:item.category,name:item.name,
   }));
-  if(item.dragUrl){
+  const browserFile=localFiles&&activeProject()?localFiles.get(activeProject(),item):null;
+  if(browserFile){
+    // Preserve the snapshot File object itself. DownloadURL alongside it would
+    // add a delayed virtual download and can interfere with native drop targets.
+    event.dataTransfer.items.add(browserFile);
+  }else if(item.dragUrl){
     // Chromium exposes DownloadURL to Windows file drop targets. It is a virtual file,
     // so native applications that only accept CF_HDROP may still require Explorer.
     const mime={png:"image/png",jpg:"image/jpeg",jpeg:"image/jpeg",webp:"image/webp",gif:"image/gif",mp4:"video/mp4",mov:"video/quicktime",webm:"video/webm"}[item.name.split(".").pop().toLowerCase()]||"application/octet-stream";
     event.dataTransfer.setData("DownloadURL",mime+":"+item.name+":"+item.dragUrl);
   }
-  const browserFile=dragFileCache.get(item.path+":"+item.modified);
-  if(browserFile instanceof File)event.dataTransfer.items.add(browserFile);
   event.dataTransfer.effectAllowed="copyMove";
 });
 root.addEventListener("pointerenter",event=>{
@@ -681,6 +1012,9 @@ root.addEventListener("pointerup",()=>{
   chrome.storage.local.set({paneHeights:state.paneHeights}).catch(status);
 });
 root.addEventListener("dragover",event=>{
+  if(event.target.closest('[data-connect-folder]')){
+    event.preventDefault();event.dataTransfer.dropEffect='copy';return;
+  }
   const shot=event.target.closest(".shot");
   if(shot||event.target.closest(".files")){
     event.preventDefault();
@@ -692,6 +1026,19 @@ root.addEventListener("dragleave",event=>{
   event.target.closest(".shot")?.classList.remove("drop-target");
 });
 root.addEventListener("drop",async event=>{
+  const connection=event.target.closest('[data-connect-folder]');
+  if(connection){
+    event.preventDefault();
+    // Read entries while the browser's drop data store is still available.
+    const entries=[...event.dataTransfer.items].map(item=>item.webkitGetAsEntry?.()).filter(Boolean);
+    try{
+      const project=state.projects.find(item=>item.name===connection.dataset.connectFolder);
+      if(!project||!localFiles)throw new Error('Folder connection is unavailable. Reload the extension.');
+      if(entries.length!==1)throw new Error('Drop one project root folder.');
+      localFiles.connect(project,entries[0]);state.modal=null;state.error='';render();
+    }catch(error){status(error);}
+    return;
+  }
   const shot=event.target.closest(".shot");
   const filesArea=event.target.closest(".files");
   if(!shot&&!filesArea)return;
@@ -700,7 +1047,11 @@ root.addEventListener("drop",async event=>{
   try{
     const targetShot=shot?.dataset.shot||state.shot;
     if(!targetShot)throw new Error("Select a shot first");
-    const destination={project:state.project,sequence:state.sequence||null,shot:targetShot};
+    const row=event.target.closest('.file-row');
+    const targetFile=row?fileForRow(row):null;
+    const destination={project:state.project,sequence:state.sequence||null,shot:targetShot,...importOptions(event.shiftKey),
+      ...(event.target.closest('[data-drop-category]')?{category:event.target.closest('[data-drop-category]').dataset.dropCategory}:{}),
+      ...(targetFile&&state.subversionsEnabled?{subversion:true,targetExisting:targetFile.name,targetCategory:targetFile.category,category:targetFile.category}: {})};
     const internal=event.dataTransfer.getData("application/x-airenamer-file");
     if(internal&&shot){
       const source=JSON.parse(internal);
@@ -730,7 +1081,7 @@ async function activateTab(tab) {
   const [previous,tabContext,stored]=await Promise.all([
     tabId!==null?message("getDestination",{tabId}):null,
     tabId!==null?message("getContext",{tabId}):null,
-    chrome.storage.local.get(["lastContext","lastDestination","panelTheme","paneHeights"]),
+    chrome.storage.local.get(["lastContext","lastDestination","panelTheme","paneHeights","desktopDragMode","desktopDragModeRevision"]),
   ]);
   if(state.tabId!==tabId)return;
   const context=stored.lastContext||previous||tabContext||{};
@@ -740,6 +1091,10 @@ async function activateTab(tab) {
   state.shot=savedShot?.project===state.project&&
     (savedShot.sequence||"")===(state.sequence||"") ? savedShot.shot : previous?.shot||"";
   state.theme=stored.panelTheme||"system";
+  state.desktopDragMode=stored.desktopDragModeRevision===1&&stored.desktopDragMode==='browser'?'browser':'native';
+  if(stored.desktopDragModeRevision!==1)
+    await chrome.storage.local.set({desktopDragMode:state.desktopDragMode,desktopDragModeRevision:1});
+  if(state.desktopDragMode==='native')warmNativeDrag();
   if(stored.paneHeights)state.paneHeights={...state.paneHeights,...stored.paneHeights};
   state.layout="";state.sequences=[];state.shots=[];state.files=[];
   state.selected.clear();state.query="";state.openMenu=null;
@@ -763,6 +1118,6 @@ setInterval(()=>{
     const tabs=await chrome.tabs.query({active:true,currentWindow:true});
     await activateTab(tabs[0]);
     await refreshRecent();
-  }catch(error){status(error);}
+  }catch(error){state.loading=false;status(error);}
 })();
 })();

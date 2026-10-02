@@ -438,14 +438,16 @@ PROJECT_LAYOUTS = {PROJECT_LAYOUT_SEQUENCES, PROJECT_LAYOUT_SHOTS}
 SHOT_WORK_FOLDERS = {"animation", "art_direction", "audio", "cache", "compo", "dmp", "fx", "genai", "layout", "previews", "render", "renderoutput", "roto", "source", "temp", "tracking"}
 
 
-def _layout_child_directories(path: str) -> list[str]:
+def _layout_child_directories(path: str, limit: int | None = None) -> list[str]:
     try:
-        return [
-            os.path.join(path, name)
-            for name in os.listdir(path)
-            if os.path.isdir(os.path.join(path, name))
-            and not is_ignored(os.path.join(path, name), name)
-        ]
+        children = []
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_dir() and not is_ignored(entry.path, entry.name):
+                    children.append(entry.path)
+                    if limit is not None and len(children) >= limit:
+                        break
+        return children
     except (OSError, TypeError):
         return []
 
@@ -488,29 +490,81 @@ def detect_project_layout(
 
     scene_root = join_prefixed(project_path, scene_prefix)
     shot_root = lambda path: join_prefixed(path, shot_prefix)
-    has_media = lambda path: any(
-        os.path.isdir(os.path.join(join_prefixed(path, target_prefix), folder))
-        for folder in category_folders if folder
-    )
-    direct_root = shot_root(scene_root)
-    direct_candidates = _layout_child_directories(direct_root)
-    sequence_candidates = _layout_child_directories(scene_root)
+    def has_media(path: str) -> bool:
+        target = join_prefixed(path, target_prefix)
+        if target != path and is_ignored(target, os.path.basename(target)):
+            return False
+        return any(
+            os.path.isdir(os.path.join(target, folder))
+            and not is_ignored(os.path.join(target, folder), folder)
+            for folder in category_folders if folder
+        )
 
-    # A shot often contains work departments; those folders are not nested shots.
-    if any(sum(os.path.basename(child).casefold() in SHOT_WORK_FOLDERS
-               for child in _layout_child_directories(path)) >= 2
-           for path in direct_candidates):
+    def work_folders(path: str) -> set[str]:
+        return {
+            os.path.basename(child).casefold()
+            for child in _layout_child_directories(path, limit=16)
+        } & SHOT_WORK_FOLDERS
+
+    direct_root = shot_root(scene_root)
+    # A project can contain thousands of shots on a network drive. Inspect a
+    # representative, bounded set instead of traversing the whole tree for
+    # every project registration and navigation request.
+    direct_candidates = _layout_child_directories(direct_root, limit=24)
+    sequence_candidates = (
+        direct_candidates if direct_root == scene_root
+        else _layout_child_directories(scene_root, limit=24)
+    )
+
+    def has_visible_genai(path: str) -> bool:
+        marker = os.path.join(path, "genai")
+        return not is_ignored(marker, "genai") and os.path.isdir(marker)
+
+    # Most active projects contain genai. Decide from the first real shot we
+    # encounter, before probing the rest of a large remote project tree.
+    if direct_root != scene_root:
+        for path in direct_candidates:
+            if has_visible_genai(path):
+                return PROJECT_LAYOUT_SHOTS
+    nested_shots = []
+    for sequence_path in sequence_candidates:
+        if direct_root == scene_root and has_visible_genai(sequence_path):
+            return PROJECT_LAYOUT_SHOTS
+        sample = _layout_child_directories(shot_root(sequence_path), limit=4)
+        for path in sample:
+            if has_visible_genai(path):
+                return PROJECT_LAYOUT_SEQUENCES
+        nested_shots.extend(sample)
+        if len(nested_shots) >= 32:
+            break
+
+    direct_work = [work_folders(path) for path in direct_candidates]
+    nested_work = [work_folders(path) for path in nested_shots]
+
+    # genai is a strong shot marker. Look at both possible depths before
+    # deciding: numeric sequence and shot names do not reveal the layout.
+    direct_genai = sum("genai" in folders for folders in direct_work)
+    nested_genai = sum("genai" in folders for folders in nested_work)
+    if nested_genai > direct_genai:
+        return PROJECT_LAYOUT_SEQUENCES
+    if direct_genai > nested_genai:
+        return PROJECT_LAYOUT_SHOTS
+
+    direct_departments = sum(len(folders) >= 2 for folders in direct_work)
+    nested_departments = sum(len(folders) >= 2 for folders in nested_work)
+    if nested_departments > direct_departments:
+        return PROJECT_LAYOUT_SEQUENCES
+    if direct_departments > nested_departments:
         return PROJECT_LAYOUT_SHOTS
 
     direct_media = sum(has_media(path) for path in direct_candidates)
     nested_media = 0
     nested_shot_names = 0
-    for sequence_path in sequence_candidates:
-        for shot_path in _layout_child_directories(shot_root(sequence_path)):
-            nested_media += int(has_media(shot_path))
-            nested_shot_names += int(
-                bool(re.match(r"^(?:sh|shot)[-_ ]?\d+", os.path.basename(shot_path), re.I))
-            )
+    for shot_path in nested_shots:
+        nested_media += int(has_media(shot_path))
+        nested_shot_names += int(
+            bool(re.match(r"^(?:sh|shot)[-_ ]?\d+", os.path.basename(shot_path), re.I))
+        )
 
     if nested_media > direct_media:
         return PROJECT_LAYOUT_SEQUENCES
@@ -534,7 +588,7 @@ def detect_project_layout(
 
     # A populated second directory level is a useful final signal for projects
     # that have not received media yet.
-    if any(_layout_child_directories(shot_root(path)) for path in sequence_candidates):
+    if any(_layout_child_directories(shot_root(path), limit=1) for path in sequence_candidates):
         return PROJECT_LAYOUT_SEQUENCES
     if direct_candidates:
         return PROJECT_LAYOUT_SHOTS
@@ -569,7 +623,9 @@ def config_store_lock(timeout: float = 15.0):
     while the lease-backed file lock coordinates separate application
     processes without nested self-deadlocks.
     """
-    with _CONFIG_STORE_PROCESS_LOCK:
+    if not _CONFIG_STORE_PROCESS_LOCK.acquire(timeout=max(0.0, timeout)):
+        raise TimeoutError(f"Timed out waiting for config process lock: {_bundle_lock_path()}")
+    try:
         depth = int(getattr(_CONFIG_STORE_CONTEXT, "depth", 0))
         if depth:
             _CONFIG_STORE_CONTEXT.depth = depth + 1
@@ -589,6 +645,8 @@ def config_store_lock(timeout: float = 15.0):
                 yield
         finally:
             _CONFIG_STORE_CONTEXT.depth = 0
+    finally:
+        _CONFIG_STORE_PROCESS_LOCK.release()
 
 
 @contextmanager
@@ -2003,24 +2061,37 @@ def load_settings():
     IGNORED_FOLDERS.clear()
     IGNORED_NAMES.clear()
     IGNORED_PATHS.clear()
+    def read_current_settings():
+        snapshot = _file_snapshot(SETTINGS_FILE)
+        error = ""
+        if snapshot["exists"]:
+            try:
+                raw_settings = json.loads(snapshot["content"].decode("utf-8"))
+                if not isinstance(raw_settings, dict):
+                    raise ValueError("settings root must be a JSON object")
+                data = _normalize_settings_snapshot(raw_settings)
+            except Exception as exc:
+                error = str(exc)
+                data = _normalize_settings_snapshot(default_settings())
+        else:
+            data = _normalize_settings_snapshot(default_settings())
+        return data, list(get_machine_ignored_folders()), error
+
     validation_error = ""
     try:
-        with config_store_lock():
-            snapshot = _file_snapshot(SETTINGS_FILE)
-            if snapshot["exists"]:
-                try:
-                    raw_settings = json.loads(snapshot["content"].decode("utf-8"))
-                    if not isinstance(raw_settings, dict):
-                        raise ValueError("settings root must be a JSON object")
-                    data = _normalize_settings_snapshot(raw_settings)
-                except Exception as exc:
-                    validation_error = str(exc)
-                    data = _normalize_settings_snapshot(default_settings())
-            else:
-                data = _normalize_settings_snapshot(default_settings())
-            machine_ignored = list(get_machine_ignored_folders())
+        # Writes use atomic replacement. A busy writer should not make an
+        # already saved project list disappear when the Browser starts.
+        with config_store_lock(timeout=1.0):
+            data, machine_ignored, validation_error = read_current_settings()
+    except TimeoutError:
+        try:
+            data, machine_ignored, validation_error = read_current_settings()
+        except Exception as exc:
+            validation_error = str(exc)
+            data = _normalize_settings_snapshot(default_settings())
+            machine_ignored = []
     except Exception as exc:
-        validation_error = validation_error or str(exc)
+        validation_error = str(exc)
         data = _normalize_settings_snapshot(default_settings())
         machine_ignored = []
 
@@ -2267,20 +2338,35 @@ def get_projects_file(machine_id: str | None = None) -> str:
     return os.path.join(PROJECTS_DIR, f"{get_machine_id(machine_id)}.json")
 
 def get_machine_state(machine_id: str | None = None) -> dict:
-    with config_store_lock():
-        machine_file = get_projects_file(machine_id)
-        state, changed, error, _snapshot = _read_machine_state_snapshot(
-            machine_file
+    machine_file = get_projects_file(machine_id)
+    state, changed, error, snapshot = _read_machine_state_snapshot(machine_file)
+    if error:
+        record_runtime_warning(
+            f"Invalid per-machine state at '{machine_file}' was preserved "
+            f"and not applied: {error}"
         )
-        if error:
-            record_runtime_warning(
-                f"Invalid per-machine state at '{machine_file}' was preserved "
-                f"and not applied: {error}"
-            )
-            return empty_machine_state()
-        if not os.path.exists(machine_file) or changed:
-            atomic_write_json(machine_file, state)
+        return empty_machine_state()
+    if snapshot["exists"] and not changed:
         return state
+
+    # Only creation/migration needs the coordinator. The normal read path
+    # observes one complete file because every writer replaces it atomically.
+    try:
+        with config_store_lock(timeout=1.0):
+            state, changed, error, snapshot = _read_machine_state_snapshot(machine_file)
+            if error:
+                record_runtime_warning(
+                    f"Invalid per-machine state at '{machine_file}' was preserved "
+                    f"and not applied: {error}"
+                )
+                return empty_machine_state()
+            if not snapshot["exists"] or changed:
+                atomic_write_json(machine_file, state)
+    except TimeoutError:
+        # An existing legacy file can still be read in normalized form; its
+        # on-disk migration waits until the next successful write.
+        return state
+    return state
 
 def get_projects(machine_id: str | None = None):
     """Read this machine's project shortcuts from structured local state."""

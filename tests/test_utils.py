@@ -1111,3 +1111,16 @@ def test_embedded_ffmpeg_rejects_hash_damage(monkeypatch, tmp_path):
         match="size mismatch|SHA-256 mismatch",
     ):
         utils._verified_embedded_ffmpeg(str(embedded_root))
+
+
+@pytest.mark.parametrize("template,filename,expected", [
+    ("{shot}-{type}-{version}-r{subversion}{format}", "SH010-STILL-001-r02.png", (1,2)),
+    ("{sequence}_{shot}_{type}_v{version}_{subversion}{format}", "SH010_IMG_v1000_101.jpg", (1000,101)),
+    ("{shot}.{version}.{subversion}{format}", "SH010.002.03.png", (2,3)),
+    ("{shot}_{version}{format}", "SH010_003.png", (3,0)),
+    ("{shot}_{type}{version}_{subversion}{format}", "SH010_IMG005_01.png", (5,1)),
+    ("{shot}-{version}-{version}-s{subversion}{format}", "SH010-006-006-s04.png", (6,4)),
+])
+def test_custom_template_version_parser(monkeypatch,template,filename,expected):
+    monkeypatch.setattr(config,"FILENAME_TEMPLATE",template)
+    assert utils.parse_version_from_filename(filename)==expected

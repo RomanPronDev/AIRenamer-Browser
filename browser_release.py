@@ -11,8 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = (
-    "browser_native.py", "browser_update.py", "browser_release.py",
-    "config.py", "utils.py", "runtime_support.py", "version.json",
+    "browser_native.py", "browser_update.py", "browser_release.py", "browser_drag.py", "browser_settings.py",
+    "native_drag/DragBridge.cs", "native_drag/Build-DragBridge.ps1",
+    "native_drag/README.md",
+    "config.py", "utils.py", "runtime_support.py", "version.json", "conftest.py",
     "MediaRenamerBrowserNative.spec", "browser-requirements.txt",
     "Install-BrowserNative.ps1", "Setup-Browser.cmd", "Update-Browser.ps1",
     "Update-Browser.cmd", "Uninstall-BrowserNative.ps1", "LICENSE",
@@ -20,7 +22,8 @@ SOURCE_FILES = (
     "third_party_licenses/Python-3.14.5-PSF.txt",
     "third_party_licenses/Pillow-12.2.0-MIT-CMU-and-third-party.txt",
     "third_party_licenses/PyInstaller-6.20.0-GPL-2.0-or-later-with-Bootloader-Exception.txt",
-    "tests/test_browser_native.py", "tests/test_browser_update.py",
+    "tests/test_browser_native.py", "tests/test_browser_update.py", "tests/test_browser_drag.py",
+    "tests/test_browser_settings.py",
     "tests/test_config.py", "tests/test_utils.py",
 )
 
@@ -52,6 +55,8 @@ def package(version: str | None = None, *, build: bool = True) -> Path:
     if version != extension_version:
         raise ValueError("Version mismatch between package and Chrome manifest")
     if build:
+        subprocess.run(["powershell.exe", "-NoProfile", "-File",
+                        str(ROOT / "native_drag" / "Build-DragBridge.ps1")], cwd=ROOT, check=True)
         subprocess.run([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
                         str(ROOT / "MediaRenamerBrowserNative.spec")],
                        cwd=ROOT, check=True)

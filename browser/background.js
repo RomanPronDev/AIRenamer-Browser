@@ -61,7 +61,7 @@ function nativeCall(type, payload={}) {
       }
       const id=++nextId;
       const timer=setTimeout(()=>{nativePending.delete(id);reject(new Error("Local companion is not responding"));},
-        type==="add_project"?300000:120000);
+        ["add_project","change_project_path","choose_project_folder"].includes(type)?300000:120000);
       nativePending.set(id,{resolve,reject,timer});
       nativePort.postMessage({id,type,payload});
     }catch(error){reject(error);}
@@ -82,11 +82,13 @@ async function removeOldSiteHooks() {
 chrome.runtime.onInstalled.addListener(()=>{
   removeOldSiteHooks().catch(()=>{});
   ensureUpdateAlarm().catch(()=>{});
+  warmNativeDragIfEnabled().catch(()=>{});
 });
 chrome.runtime.onStartup.addListener(()=>{
   removeOldSiteHooks().catch(()=>{});
   reloadIfUpdated().catch(()=>{});
   ensureUpdateAlarm().catch(()=>{});
+  warmNativeDragIfEnabled().catch(()=>{});
 });
 chrome.alarms.onAlarm.addListener(alarm=>{
   if (alarm.name===UPDATE_ALARM)checkForUpdate().catch(console.error);
@@ -97,6 +99,11 @@ chrome.alarms.onAlarm.addListener(alarm=>{
   }
 });
 ensureUpdateAlarm().catch(()=>{});
+async function warmNativeDragIfEnabled() {
+  const stored=await chrome.storage.local?.get(['desktopDragMode','desktopDragModeRevision']);
+  if(stored?.desktopDragModeRevision!==1||stored?.desktopDragMode!=='browser')await nativeCall('drag_prepare');
+}
+warmNativeDragIfEnabled().catch(()=>{});
 chrome.downloads.onCreated.addListener(()=>{chrome.runtime.sendMessage({kind:"recentChanged"}).catch(()=>{});});
 chrome.downloads.onChanged.addListener(()=>{chrome.runtime.sendMessage({kind:"recentChanged"}).catch(()=>{});});
 chrome.tabs.onRemoved.addListener(tabId=>{

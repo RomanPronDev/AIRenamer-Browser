@@ -14,6 +14,8 @@ import time
 import urllib.request
 import zipfile
 from contextlib import contextmanager
+from functools import lru_cache
+from itertools import product
 
 # Ensure the project root is in the Python path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -51,8 +53,46 @@ def get_target_directory(shot_path, file_type=None, category=None):
         log_action(f"Auto-created target subfolder: {target_path}")
     return target_path
 
+@lru_cache(maxsize=32)
+def _version_patterns(template):
+    # Empty tokens are cleaned exactly like generated names. Cache the small
+    # set of patterns instead of rebuilding them for each file on a share.
+    fields = list(dict.fromkeys(re.findall(r"\{(\w+)\}", template)))
+    optional = [field for field in fields if field != "version"]
+    patterns = []
+    for present in product((True, False), repeat=len(optional)):
+        omitted = {field for field, keep in zip(optional, present) if not keep}
+        marked = re.sub(r"\{(\w+)\}", lambda m: "" if m[1] in omitted else "AIRENAMERTOKEN" + m[1] + "END", template)
+        marked = clean_filename_base(marked)
+        parts = re.split(r"(AIRENAMERTOKEN(?:sequence|scene|shot|type|version|subversion|format)END)", marked)
+        seen = set(); regex = ""
+        for part in parts:
+            if part.startswith("AIRENAMERTOKEN") and part.endswith("END"):
+                field = part[len("AIRENAMERTOKEN"):-3]
+                if field in seen:
+                    regex += "(?P=" + field + ")"
+                else:
+                    value = r"\d{3,}" if field == "version" else r"\d{2,}" if field == "subversion" else r"[_\-.]?\d+x\d+" if field == "format" else r".+?"
+                    regex += "(?P<" + field + ">" + value + ")"
+                    seen.add(field)
+            else:
+                regex += re.escape(part)
+        patterns.append(re.compile(regex, re.IGNORECASE))
+    return patterns
+
+
 def parse_version_from_filename(filename: str):
-    match = re.search(r'_v(\d{3})(?:_(\d{2}))?', filename, re.IGNORECASE)
+    legacy = re.search(r'_v(\d{3,})(?:_(\d{2,}))?', filename, re.IGNORECASE)
+    template = config.FILENAME_TEMPLATE or config.DEFAULT_FILENAME_TEMPLATE
+    if "{subversion}" not in template and legacy and legacy.group(2):
+        return int(legacy.group(1)), int(legacy.group(2))
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    for pattern in _version_patterns(config.FILENAME_TEMPLATE or config.DEFAULT_FILENAME_TEMPLATE):
+        match = pattern.fullmatch(stem)
+        if match:
+            return int(match["version"]), int(match.groupdict().get("subversion") or 0)
+    # Continue recognizing files created with the former standard template.
+    match = re.search(r'_v(\d{3,})(?:_(\d{2,}))?', filename, re.IGNORECASE)
     if not match:
         return None
     return int(match.group(1)), int(match.group(2) or 0)

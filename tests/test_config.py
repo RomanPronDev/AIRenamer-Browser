@@ -769,6 +769,20 @@ def test_json_file_lock_recovers_stale_lock(tmp_path):
     assert not lock_path.exists()
 
 
+def test_exclusive_file_lock_recovers_recent_abandoned_empty_lock(tmp_path):
+    lock_path = tmp_path / "abandoned.lock"
+    lock_path.write_bytes(b"")
+    old = time.time() - 10
+    os.utime(lock_path, (old, old))
+
+    with config.exclusive_file_lock(
+        str(lock_path), timeout=0.3, poll_interval=0.01, stale_seconds=300
+    ):
+        assert lock_path.exists()
+
+    assert not lock_path.exists()
+
+
 def test_exclusive_file_lock_renews_live_lease(tmp_path):
     lock_path = tmp_path / "live.lock"
 
@@ -878,6 +892,58 @@ def test_detect_project_layout_treats_work_folders_beneath_shot_as_direct(tmp_pa
         str(project), config.PROJECT_LAYOUT_SEQUENCES
     ) == config.PROJECT_LAYOUT_SHOTS
     assert config.is_ignored(str(project / "pge0050" / "_shotcode"), "_shotcode")
+
+
+def test_detect_project_layout_finds_numeric_sequence_by_genai_and_skips_ignored(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "SCENE_PREFIX", "")
+    monkeypatch.setattr(config, "SHOT_PREFIX", "")
+    monkeypatch.setattr(config, "IGNORED_NAMES", {"Reformat"})
+    monkeypatch.setattr(config, "IGNORED_PATHS", set())
+    project = tmp_path / "NumericSequences"
+    (project / "30" / "0010" / "genai").mkdir(parents=True)
+    (project / "30" / "0020" / "genai").mkdir(parents=True)
+    (project / "Reformat" / "30" / "genai").mkdir(parents=True)
+
+    assert config.detect_project_layout(
+        str(project), config.PROJECT_LAYOUT_SHOTS
+    ) == config.PROJECT_LAYOUT_SEQUENCES
+    assert "Reformat" not in [
+        os.path.basename(path) for path in config._layout_child_directories(str(project))
+    ]
+
+
+def test_detect_project_layout_bounds_directory_scans(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SCENE_PREFIX", "")
+    monkeypatch.setattr(config, "SHOT_PREFIX", "")
+    project = tmp_path / "LargeNetworkStyleProject"
+    for index in range(80):
+        (project / f"SQ{index:03d}" / "SH010" / "genai").mkdir(parents=True)
+    original = config._layout_child_directories
+    limits = []
+
+    def checked_children(path, limit=None):
+        limits.append(limit)
+        return original(path, limit=limit)
+
+    monkeypatch.setattr(config, "_layout_child_directories", checked_children)
+    assert config.detect_project_layout(str(project)) == config.PROJECT_LAYOUT_SEQUENCES
+    assert limits and all(limit is not None and limit <= 24 for limit in limits)
+    assert len(limits) <= 4
+
+
+def test_detect_project_layout_ignores_genai_in_excluded_folder(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "SCENE_PREFIX", "")
+    monkeypatch.setattr(config, "SHOT_PREFIX", "")
+    monkeypatch.setattr(config, "IGNORED_NAMES", {"Reformat"})
+    monkeypatch.setattr(config, "IGNORED_PATHS", set())
+    project = tmp_path / "DirectShots"
+    (project / "0010" / "genai").mkdir(parents=True)
+    (project / "Reformat" / "30" / "genai").mkdir(parents=True)
+    assert config.detect_project_layout(
+        str(project), config.PROJECT_LAYOUT_SEQUENCES
+    ) == config.PROJECT_LAYOUT_SHOTS
 
 
 

@@ -8,6 +8,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+function Start-OptionalFFmpegSetup([string] $Executable, [string] $InstallDirectory) {
+    try {
+        Start-Process -FilePath $Executable -ArgumentList '--install-ffmpeg' -WindowStyle Hidden -ErrorAction Stop
+        Write-Output 'FFmpeg background setup started. Conversion will verify readiness when needed.'
+    } catch {
+        $detail = "Optional FFmpeg setup could not start. Native host: $Executable`r`n$($_.Exception.ToString())"
+        $diagnostic = Join-Path $InstallDirectory 'setup-ffmpeg-launch.log'
+        try { [System.IO.File]::WriteAllText($diagnostic, $detail, [System.Text.UTF8Encoding]::new($false)) } catch { }
+        Write-Warning 'AIRenamer installation completed, but Windows declined optional FFmpeg setup. Conversion will retry on first use.'
+        Write-Output "Launch diagnostics: $diagnostic"
+        Write-Output 'If the Chrome panel cannot connect either, the local companion may also be blocked by Windows or company policy. Ask IT to review the executable and the launch log.'
+    }
+}
+
 function Get-UnpackedExtensionId([string] $Folder) {
     # Chromium hashes the Windows FilePath UTF-16 bytes and maps the first
     # 16 SHA-256 bytes from hexadecimal to the a-p extension ID alphabet.
@@ -99,7 +113,19 @@ $manifest = @{
 $registryPath = 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.airenamer.browser'
 New-Item -Path $registryPath -Force | Out-Null
 Set-Item -Path $registryPath -Value $manifestPath
-$installation = @{ extensionFolder = $installedExtension; version = $version }
+$legacySharedSettings = $false
+if ($previousVersion -match '^\d+\.\d+\.\d+$') {
+    $legacySharedSettings = [version]$previousVersion -lt [version]'0.27.7'
+}
+# Preserve a pending migration across updates before the Browser first opens.
+$installationPath = Join-Path $installBase 'installation.json'
+if (Test-Path -LiteralPath $installationPath) {
+    try {
+        $oldInstallation = Get-Content -LiteralPath $installationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($oldInstallation.legacySharedSettings -eq $true) { $legacySharedSettings = $true }
+    } catch { }
+}
+$installation = @{ extensionFolder = $installedExtension; version = $version; legacySharedSettings = $legacySharedSettings }
 $installationPath = Join-Path $installBase 'installation.json'
 [System.IO.File]::WriteAllText($installationPath, ($installation | ConvertTo-Json -Depth 3), [System.Text.UTF8Encoding]::new($false))
 $installedFFmpeg = Join-Path (Split-Path -Parent $installBase) 'Tools\ffmpeg.exe'
@@ -111,8 +137,7 @@ if (Test-Path -LiteralPath $installedFFmpeg) {
     } catch { $ffmpegReady = $false }
 }
 if (-not $ffmpegReady) {
-    Start-Process -FilePath $installedExe -ArgumentList '--install-ffmpeg' -WindowStyle Hidden
-    Write-Output 'FFmpeg is downloading in the background for first use.'
+    Start-OptionalFFmpegSetup -Executable $installedExe -InstallDirectory $installBase
 }
 Write-Output 'Local companion installed. Chrome starts it automatically when AIRenamer needs a file.'
 if (-not $previousVersion) {
@@ -131,7 +156,11 @@ if ($OpenChromeExtensions -and $manualChromeSetup) {
     )
     $chrome = $chromeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if ($chrome) {
-        Start-Process -FilePath $chrome -ArgumentList 'chrome://extensions'
+        try {
+            Start-Process -FilePath $chrome -ArgumentList 'chrome://extensions' -ErrorAction Stop
+        } catch {
+            Write-Warning 'Installation completed, but Chrome could not be opened automatically. Open chrome://extensions manually.'
+        }
     } else {
         Write-Output 'Open chrome://extensions in Chrome to load the extension folder.'
     }

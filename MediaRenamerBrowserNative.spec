@@ -7,7 +7,7 @@ root = Path(SPECPATH)
 a = Analysis(
     ["browser_native.py"],
     pathex=[SPECPATH],
-    binaries=[],
+    binaries=[(str(root / "build_assets" / "BrowserDragBridge.exe"), ".")],
     datas=[(str(root / "version.json"), "."),
            (str(root / "LICENSE"), "."),
            (str(root / "BROWSER_SOURCE.md"), "."),
@@ -15,7 +15,7 @@ a = Analysis(
            (str(root / "third_party_licenses" / "Python-3.14.5-PSF.txt"), "third_party_licenses"),
            (str(root / "third_party_licenses" / "Pillow-12.2.0-MIT-CMU-and-third-party.txt"), "third_party_licenses"),
            (str(root / "third_party_licenses" / "PyInstaller-6.20.0-GPL-2.0-or-later-with-Bootloader-Exception.txt"), "third_party_licenses")],
-    hiddenimports=["config", "utils", "browser_update", "PIL.Image", "PIL.ImageOps"],
+    hiddenimports=["config", "utils", "browser_update", "browser_drag", "browser_settings", "PIL.Image", "PIL.ImageOps"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

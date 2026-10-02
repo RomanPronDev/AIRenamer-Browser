@@ -5,6 +5,9 @@ and PyInstaller 6.20.0. Their license texts are included in
 `third_party_licenses/` and in the native executable. The Browser build excludes
 the desktop application's Qt/PyQt dependencies.
 
+The experimental Windows drag helper uses the operating system's installed
+.NET Framework / Windows Forms runtime, which is not redistributed here.
+
 FFmpeg is not included in the AIRenamer Browser package. On setup, the program
 uses an existing local FFmpeg or downloads the GPL Windows build directly from
 the [BtbN FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds) release page,

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function worker() {
+function worker(desktopDragMode='browser',desktopDragModeRevision=1) {
   const events = {}, calls = [], session = {};
   let installedVersion='0.26.28';
   const on = name => ({addListener(fn) { events[name] = fn; }});
@@ -18,7 +18,7 @@ function worker() {
       reload: () => calls.push(['reload']),
       connectNative: () => ({
         onMessage:on('nativeMessage'),onDisconnect:on('nativeDisconnect'),
-        postMessage(message) { queueMicrotask(() => events.nativeMessage({id:message.id,ok:true,result:{type:message.type}})); },
+        postMessage(message) { calls.push(['native',message.type]);queueMicrotask(() => events.nativeMessage({id:message.id,ok:true,result:{type:message.type}})); },
       }),
       onInstalled:on('installed'),onStartup:on('startup'),onMessage:on('message'),
     },
@@ -31,7 +31,7 @@ function worker() {
     alarms:{get:async()=>null,create:async(name,options)=>calls.push(['alarm',name,options]),
       onAlarm:on('alarm')},
     idle:{queryState:async()=> 'idle'},
-    storage:{session:{
+    storage:{local:{get:async()=>({desktopDragMode,desktopDragModeRevision})},session:{
       set:async values=>Object.assign(session,values),
       get:async key=>({[key]:session[key]}),
       remove:async keys=>{for(const key of keys)delete session[key];},
@@ -41,6 +41,20 @@ function worker() {
   const send = message => new Promise(resolve=>events.message(message,{id:'extension-id',url:'chrome-extension://extension-id/live.html'},resolve));
   return {events,calls,send,setInstalledVersion:value=>{installedVersion=value;}};
 }
+
+test('Chrome startup warms native drag and respects an explicit browser fallback',async()=>{
+  const enabled=worker('native'),disabled=worker();
+  enabled.events.startup();disabled.events.startup();
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert(enabled.calls.some(item=>item[0]==='native'&&item[1]==='drag_prepare'));
+  assert(!disabled.calls.some(item=>item[0]==='native'&&item[1]==='drag_prepare'));
+});
+
+test('Chrome startup prepares native drag without a previous preference',async()=>{
+  const app=worker('browser',0);
+  app.events.startup();await new Promise(resolve=>setTimeout(resolve,0));
+  assert(app.calls.some(item=>item[0]==='native'&&item[1]==='drag_prepare'));
+});
 
 test('periodic alarm starts updater and reloads when installed host is newer', async()=>{
   const app=worker();

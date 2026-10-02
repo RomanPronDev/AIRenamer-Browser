@@ -6,6 +6,8 @@ filesystem paths. stdout is reserved for length-prefixed protocol messages.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+from contextlib import redirect_stdout
 import base64
 import io
 import mimetypes
@@ -28,11 +30,38 @@ from urllib.parse import quote, urlsplit
 import config
 import utils
 import browser_update
+import browser_drag
+import browser_settings
 
 MAX_INBOUND = 64 * 1024 * 1024
 MAX_OUTBOUND = 1024 * 1024
 MAX_CHUNK = 256 * 1024
 MAX_IMAGE_BYTES = 600 * 1024
+
+
+PREFERENCE_KEYS = ("filename_template", "image_type_suffix", "video_type_suffix",
+                   "subversion_enabled", "image_extensions", "video_extensions", "additional_categories")
+
+
+def _check_category_folders(settings, structure):
+    folders = [structure["imageFolder"], structure["videoFolder"]] + [
+        item["folder"] for item in settings.get("additional_categories", [])]
+    if len({name.casefold() for name in folders}) != len(folders):
+        raise HostError("Category folders must be unique, including project folder overrides.")
+
+
+def _naming_preview(settings, sequence="SEQ010", shot="SH010"):
+    values = {"sequence": sequence, "scene": sequence, "shot": shot, "version": "001", "format": ""}
+    enabled = config.parse_yes_no(settings["subversion_enabled"], True)
+    result = {}
+    for kind, suffix, extension in (("image", settings["image_type_suffix"], ".png"),
+                                     ("video", settings["video_type_suffix"], ".mp4")):
+        for label, sub in (("main", 0), ("subversion", 1)):
+            name = settings["filename_template"]
+            for key, value in {**values, "type": suffix, "subversion": f"{sub:02d}" if enabled else ""}.items():
+                name = name.replace("{" + key + "}", value)
+            result[kind + label.title()] = utils.clean_filename_base(name) + extension
+    return result
 
 
 class HostError(ValueError):
@@ -49,27 +78,115 @@ def _choose_project_folder(initial: str = "") -> str:
     """Show the native Windows folder picker without bundling Tk or Qt."""
     if os.name != "nt":
         raise HostError("Folder selection is available only on Windows")
-    script = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        "$dialog.Description = 'Select project folder'; "
-        "if ($env:AIRENAMER_PICKER_INITIAL -and "
-        "(Test-Path -LiteralPath $env:AIRENAMER_PICKER_INITIAL -PathType Container)) "
-        "{ $dialog.SelectedPath = $env:AIRENAMER_PICKER_INITIAL }; "
-        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
-        "{ [Console]::Out.Write($dialog.SelectedPath) }; "
-        "$dialog.Dispose()"
-    )
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$owner = New-Object System.Windows.Forms.Form
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$owner.ShowInTaskbar = $false
+$owner.TopMost = $true
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$owner.Size = [System.Drawing.Size]::new(1, 1)
+$owner.Location = [System.Windows.Forms.Cursor]::Position
+$owner.Opacity = 0.01
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Select project folder'
+$dialog.ShowNewFolderButton = $true
+try {
+    if ($env:AIRENAMER_PICKER_INITIAL -and
+        (Test-Path -LiteralPath $env:AIRENAMER_PICKER_INITIAL -PathType Container)) {
+        $dialog.SelectedPath = $env:AIRENAMER_PICKER_INITIAL
+    }
+    [void]$owner.Show()
+    $owner.Activate()
+    if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+        [System.IO.File]::WriteAllText(
+            $env:AIRENAMER_PICKER_RESULT,
+            $dialog.SelectedPath,
+            [System.Text.UTF8Encoding]::new($false))
+    }
+} finally {
+    $dialog.Dispose()
+    $owner.Close()
+    $owner.Dispose()
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="airenamer-picker-") as temporary:
+        result_file = os.path.join(temporary, "selected.txt")
+        env = utils.sanitized_subprocess_environment()
+        env["AIRENAMER_PICKER_INITIAL"] = initial
+        env["AIRENAMER_PICKER_RESULT"] = result_file
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Sta", "-WindowStyle", "Hidden",
+                 "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+                capture_output=True, timeout=300, env=env, creationflags=0x08000000,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HostError("Project folder picker timed out") from exc
+        if result.returncode:
+            raise HostError("Could not open the project folder picker")
+        if os.path.isfile(result_file):
+            return Path(result_file).read_text(encoding="utf-8").strip()
+        return ""
+
+
+def _launch_native_drag(path: str) -> None:
+    """Show a small Windows drag source that offers the real file as FileDrop."""
+    if os.name != "nt":
+        raise HostError("Desktop drag is available only on Windows")
+    script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$filePath = $env:AIRENAMER_DRAG_PATH
+if (-not [System.IO.File]::Exists($filePath)) { exit 1 }
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'AIRenamer - Drag to app'
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$form.Size = [System.Drawing.Size]::new(390, 105)
+$form.TopMost = $true
+$form.ShowInTaskbar = $false
+$form.KeyPreview = $true
+$position = [System.Windows.Forms.Cursor]::Position
+$area = [System.Windows.Forms.Screen]::FromPoint($position).WorkingArea
+$form.Location = [System.Drawing.Point]::new(
+    [Math]::Max($area.Left, [Math]::Min($position.X - 35, $area.Right - $form.Width)),
+    [Math]::Max($area.Top, [Math]::Min($position.Y - 35, $area.Bottom - $form.Height)))
+$label = New-Object System.Windows.Forms.Label
+$label.Text = [System.IO.Path]::GetFileName($filePath)
+$label.AutoEllipsis = $true
+$label.Location = [System.Drawing.Point]::new(13, 10)
+$label.Size = [System.Drawing.Size]::new(355, 27)
+$label.Font = [System.Drawing.Font]::new('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+$label.Cursor = [System.Windows.Forms.Cursors]::Hand
+$hint = New-Object System.Windows.Forms.Label
+$hint.Text = 'Drag the file name into another application. Esc closes this window.'
+$hint.Location = [System.Drawing.Point]::new(13, 44)
+$hint.Size = [System.Drawing.Size]::new(355, 20)
+$form.Controls.Add($label)
+$form.Controls.Add($hint)
+$label.Add_MouseDown({
+    $paths = New-Object System.Collections.Specialized.StringCollection
+    [void]$paths.Add($filePath)
+    $data = New-Object System.Windows.Forms.DataObject
+    $data.SetFileDropList($paths)
+    $effect = $label.DoDragDrop($data, [System.Windows.Forms.DragDropEffects]::Copy)
+    if ($effect -ne [System.Windows.Forms.DragDropEffects]::None) { $form.Close() }
+})
+$form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $form.Close() } })
+$form.Add_Shown({ $form.Activate() })
+[void]$form.ShowDialog()
+$form.Dispose()
+"""
     env = utils.sanitized_subprocess_environment()
-    env["AIRENAMER_PICKER_INITIAL"] = initial
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-Sta", "-Command", script],
-        capture_output=True, text=True, timeout=300, env=env,
-        creationflags=0x08000000,
+    env["AIRENAMER_DRAG_PATH"] = path
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-Sta", "-WindowStyle", "Hidden",
+         "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env, creationflags=0x08000000,
     )
-    if result.returncode:
-        raise HostError("Could not open the project folder picker")
-    return result.stdout.strip()
 
 
 def _children(parent: str) -> list[str]:
@@ -89,23 +206,178 @@ def _project(name: str) -> tuple[str, str]:
     if name not in projects:
         raise HostError("Unknown project")
     path = os.path.normpath(projects[name])
-    mode = config.detect_project_layout(path, config.get_project_modes().get(name))
+    data = _structure_data()
+    structure = _project_structure(name, data)
+    mode = structure.get("layout") or structure.get("defaultLayout")
+    signature = _layout_signature(path, structure)
+    cached = data.get("detected", {}).get(name, {}) if isinstance(data.get("detected"), dict) else {}
+    if mode not in config.PROJECT_LAYOUTS and isinstance(cached, dict) and cached.get("signature") == signature:
+        mode = cached.get("layout")
+    if mode not in config.PROJECT_LAYOUTS:
+        mode = _detect_layout(path, structure, config.get_project_modes().get(name))
+        try:
+            _remember_layout(name, path, structure, mode)
+        except OSError:
+            pass
     return path, mode
+
+
+_STRUCTURE_KEYS = ("scenePrefix", "shotPrefix", "targetPrefix", "imageFolder", "videoFolder")
+
+
+def _structure_file() -> str:
+    return os.path.join(config.get_local_base_dir(), "Browser", "structure.json")
+
+
+def _structure_data() -> dict:
+    data = config.read_json_file(_structure_file(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _default_structure(data: dict | None = None) -> dict:
+    data = data if data is not None else _structure_data()
+    result = {"scenePrefix": os.path.join("vfx", "shots"),
+              "shotPrefix": "",
+              "targetPrefix": "genai",
+              "imageFolder": "KEYFRAMES",
+              "videoFolder": "VIDEO",
+              "defaultLayout": "auto"}
+    stored = data.get("defaults", {})
+    if isinstance(stored, dict):
+        for key in (*_STRUCTURE_KEYS, "defaultLayout"):
+            if key in stored:
+                result[key] = stored[key]
+    return result
+
+
+def _project_structure(name: str, data: dict | None = None) -> dict:
+    data = data if data is not None else _structure_data()
+    result = _default_structure(data)
+    override = data.get("projects", {}).get(name, {}) if isinstance(data.get("projects"), dict) else {}
+    if isinstance(override, dict):
+        result.update({key: override[key] for key in (*_STRUCTURE_KEYS, "layout") if key in override})
+    return result
+
+
+def _validated_structure(payload: dict, *, defaults: bool = False) -> dict:
+    result = {}
+    for key in ("scenePrefix", "shotPrefix", "targetPrefix"):
+        try:
+            result[key] = config._validate_relative_prefix(payload.get(key, ""), key)
+        except ValueError as exc:
+            raise HostError(str(exc)) from exc
+    current = _default_structure()
+    for key in ("imageFolder", "videoFolder"):
+        value = config._valid_single_folder_name(payload.get(key, current[key]))
+        if not value:
+            raise HostError(f"{key} must be one folder name")
+        result[key] = value
+    if result["imageFolder"].casefold() == result["videoFolder"].casefold():
+        raise HostError("Image and video folders must be different")
+    layout = payload.get("defaultLayout" if defaults else "layout")
+    allowed = {"auto", *config.PROJECT_LAYOUTS} if defaults else config.PROJECT_LAYOUTS
+    if layout not in allowed:
+        raise HostError("Choose a valid project layout")
+    result["defaultLayout" if defaults else "layout"] = layout
+    _check_category_folders(config.get_settings_snapshot(), result)
+    return result
+
+
+def _sequence_root(project_path: str, structure: dict) -> str:
+    return config.join_prefixed(project_path, structure["scenePrefix"])
+
+
+def _shots_root(project_path: str, sequence: str | None, structure: dict) -> str:
+    parent = _sequence_root(project_path, structure)
+    if sequence:
+        parent = os.path.join(parent, sequence)
+    return config.join_prefixed(parent, structure["shotPrefix"])
+
+
+def _target_root(project_name: str, shot_path: str) -> str:
+    return config.join_prefixed(shot_path, _project_structure(project_name)["targetPrefix"])
+
+
+def _ensure_media_folders(project_name: str, shot_path: str) -> str:
+    target = _target_root(project_name, shot_path)
+    for category in _categories(project_name):
+        os.makedirs(os.path.join(target, category.folder), exist_ok=True)
+    return target
+
+
+def _categories(project: str | None = None):
+    structure = _project_structure(project) if project else _default_structure()
+    folders = {"keyframes": structure["imageFolder"], "video": structure["videoFolder"]}
+    return [replace(category, folder=folders.get(category.id, category.folder))
+            for category in config.get_media_categories()]
+
+
+def _layout_signature(path: str, structure: dict) -> list[str]:
+    return [os.path.normcase(os.path.normpath(path)),
+            structure["scenePrefix"], structure["shotPrefix"]]
+
+
+def _remember_layout(name: str, path: str, structure: dict, mode: str) -> None:
+    def remember(data):
+        data = dict(data) if isinstance(data, dict) else {}
+        detected = dict(data.get("detected", {})) if isinstance(data.get("detected"), dict) else {}
+        detected[name] = {"signature": _layout_signature(path, structure), "layout": mode}
+        data["detected"] = detected
+        return data
+    config.update_json_file(_structure_file(), {}, remember)
+
+
+def _detect_layout(path: str, structure: dict, fallback: str | None = None) -> str:
+    settings = {"scene_prefix": structure["scenePrefix"],
+                "shot_prefix": structure["shotPrefix"],
+                "target_prefix": structure["targetPrefix"],
+                "keyframe_folder": structure["imageFolder"],
+                "video_folder": structure["videoFolder"],
+                "additional_categories": [
+                    {"folder": category.folder}
+                    for category in config.get_media_categories()
+                    if category.id not in {"keyframes", "video"}
+                ]}
+    return config.detect_project_layout(path, fallback, settings=settings)
+
+
+def _structure_preview(project: str, values: dict) -> dict:
+    projects = config.get_projects()
+    if project not in projects:
+        raise HostError("Unknown project")
+    project_path = projects[project]
+    scene_root = _sequence_root(project_path, values)
+    layout = values["layout"]
+    if layout == config.PROJECT_LAYOUT_SEQUENCES:
+        sequences = _children(scene_root) if os.path.isdir(scene_root) else []
+        examples = [{"sequence": name, "shotsRoot": _shots_root(project_path, name, values),
+                     "shots": _children(_shots_root(project_path, name, values))[:5]
+                     if os.path.isdir(_shots_root(project_path, name, values)) else []}
+                    for name in sequences[:3]]
+        return {"projectRoot": project_path, "sequenceRoot": scene_root,
+                "exists": os.path.isdir(scene_root), "sequences": sequences[:8],
+                "sequenceCount": len(sequences), "examples": examples}
+    shots_root = _shots_root(project_path, None, values)
+    shots = _children(shots_root) if os.path.isdir(shots_root) else []
+    return {"projectRoot": project_path, "shotsRoot": shots_root,
+            "exists": os.path.isdir(shots_root), "shots": shots[:8],
+            "shotCount": len(shots)}
 
 
 def _navigation(project: str, sequence: str | None = None) -> tuple[str, str, str]:
     project_path, mode = _project(project)
+    structure = _project_structure(project)
     if mode == config.PROJECT_LAYOUT_SHOTS:
         if sequence:
             raise HostError("Project has no sequence level")
-        return project_path, mode, config.get_project_shot_root(project_path)
+        return project_path, mode, _shots_root(project_path, None, structure)
     if not sequence:
-        return project_path, mode, config.get_scene_root(project_path)
+        return project_path, mode, _sequence_root(project_path, structure)
     sequence = _component(sequence, "sequence")
-    root = config.get_scene_root(project_path)
+    root = _sequence_root(project_path, structure)
     if sequence not in _children(root):
         raise HostError("Unknown sequence")
-    return project_path, mode, config.get_shot_root(config.get_scene_path(project_path, sequence))
+    return project_path, mode, _shots_root(project_path, sequence, structure)
 
 
 def _shot(project: str, sequence: str | None, shot: str) -> tuple[str, str]:
@@ -118,9 +390,9 @@ def _shot(project: str, sequence: str | None, shot: str) -> tuple[str, str]:
     return os.path.join(root, shot), mode
 
 
-def _category(category_id: str):
+def _category(category_id: str, project: str | None = None):
     category_id = _component(category_id, "category")
-    category = config.get_media_category(category_id)
+    category = next((item for item in _categories(project) if item.id == category_id), None)
     if not category or category.id != category_id:
         raise HostError("Unknown category")
     return category
@@ -129,8 +401,8 @@ def _category(category_id: str):
 def _file(project: str, sequence: str | None, shot: str, category_id: str, name: str):
     name = _component(name, "file")
     shot_path, _ = _shot(project, sequence, shot)
-    category = _category(category_id)
-    path = os.path.join(config.get_target_base(shot_path), category.folder, name)
+    category = _category(category_id, project)
+    path = os.path.join(_target_root(project, shot_path), category.folder, name)
     if not os.path.isfile(path):
         raise HostError("File unavailable")
     return path, category
@@ -209,7 +481,10 @@ def _psd_matches(raster: str, candidates: list[str]) -> bool:
 
 
 class BrowserHost:
-    def __init__(self):
+    def __init__(self, *, initialize_settings=True):
+        if initialize_settings:
+            browser_settings.initialize()
+        self._native_drag = browser_drag.NativeDrag()
         config.load_settings()
         self.transfers: dict[str, dict] = {}
         self.conversions: dict[str, dict] = {}
@@ -217,6 +492,7 @@ class BrowserHost:
         self._drag_server = None
         self._drag_thread = None
         self._drag_entries: dict[str, tuple[str, float, bool]] = {}
+        self._direct_files: dict[str, tuple[str, float]] = {}
 
     def _drag_url(self, path: str, *, inline: bool = False) -> str:
         if self._drag_server is None:
@@ -311,6 +587,7 @@ class BrowserHost:
         return f"http://127.0.0.1:{self._drag_server.server_port}/file/{token}"
 
     def close(self):
+        self._native_drag.close()
         with self._conversion_lock:
             conversions = list(self.conversions.values())
         for job in conversions:
@@ -336,26 +613,166 @@ class BrowserHost:
     def projects(self, _=None):
         projects = config.get_projects()
         modes = config.get_project_modes()
+        data = _structure_data()
+        def layout_for(name, path):
+            structure = _project_structure(name, data)
+            override = structure.get("layout") or structure.get("defaultLayout")
+            cached = data.get("detected", {}).get(name, {}) if isinstance(data.get("detected"), dict) else {}
+            if override in config.PROJECT_LAYOUTS:
+                return override
+            if isinstance(cached, dict) and cached.get("signature") == _layout_signature(path, structure):
+                return cached.get("layout")
+            return modes.get(name) if modes.get(name) in config.PROJECT_LAYOUTS else (
+                config.PROJECT_LAYOUT_SHOTS if config.SKIP_SEQUENCE else config.PROJECT_LAYOUT_SEQUENCES)
         return {
             "projects": [
                 {"name": name, "path": path,
-                 "layout": config.detect_project_layout(path, modes.get(name)),
+                 "layout": layout_for(name, path),
+                 "structure": _project_structure(name, data),
+                 "customStructure": name in data.get("projects", {}),
                  "available": os.path.isdir(path)}
                 for name, path in sorted(projects.items(), key=lambda item: item[0].casefold())
             ],
+            "preferences": {"subversionsEnabled": config.SUBVERSION_ENABLED,
+                            "imageExtensions": list(config.ALLOWED_EXT_IMAGE),
+                            "videoExtensions": list(config.ALLOWED_EXT_VIDEO)},
             "categories": [
                 {"id": cat.id, "folder": cat.folder, "mediaType": cat.media_type, "typeSuffix": cat.type_suffix}
-                for cat in config.get_media_categories()
+                for cat in _categories()
             ],
         }
 
     def preferences(self, _=None):
         names = [item for item in config.get_machine_ignored_folders()
                  if isinstance(item, str) and not ("\\" in item or "/" in item)]
-        return {"ignoredNames": sorted(set(names) | {"_shotcode"}, key=str.casefold)}
+        settings = config.get_settings_snapshot()
+        return {"ignoredNames": sorted(set(names) | {"_shotcode"}, key=str.casefold),
+                "settings": {key: settings[key] for key in PREFERENCE_KEYS},
+                "preview": _naming_preview(settings)}
 
-    def set_ignored_names(self, payload):
-        names = payload.get("names")
+    def _candidate_preferences(self, payload):
+        patch = payload.get("settings", {})
+        if not isinstance(patch, dict) or set(patch) - set(PREFERENCE_KEYS):
+            raise HostError("Unsupported Browser setting")
+        try:
+            settings = config._normalize_settings_snapshot({**config.get_settings_snapshot(), **patch})
+        except ValueError as exc:
+            raise HostError(str(exc)) from exc
+        if set(settings["image_extensions"]) & set(settings["video_extensions"]):
+            raise HostError("Image and video extensions must not overlap.")
+        if config.parse_yes_no(settings["subversion_enabled"], True) and "{subversion}" not in settings["filename_template"]:
+            raise HostError("Include {subversion} in the filename template or disable subversions.")
+        if re.search(r"\{(?:version|subversion)\}\{(?:version|subversion)\}", settings["filename_template"]):
+            raise HostError("Separate version and subversion tokens with text or punctuation.")
+        data = _structure_data()
+        _check_category_folders(settings, _default_structure(data))
+        for name in data.get("projects", {}):
+            _check_category_folders(settings, _project_structure(name, data))
+        return settings
+
+    def preview_naming(self, payload):
+        settings = self._candidate_preferences(payload)
+        sequence = payload.get("sequence", "SEQ010")
+        shot = payload.get("shot", "SH010")
+        if not isinstance(sequence, str) or not isinstance(shot, str):
+            raise HostError("Invalid preview context")
+        return _naming_preview(settings, sequence, shot)
+
+    def set_preferences(self, payload):
+        settings = self._candidate_preferences(payload)
+        if "names" in payload:
+            clean = self._clean_ignored_names(payload["names"])
+            with config.config_store_lock():
+                machine = config._current_machine_state_unlocked()
+                machine["ignored_folders"] = [name for name in machine["ignored_folders"] if "\\" in name or "/" in name] + clean
+                config.save_config_bundle(config._canonical_bundle(settings, machine))
+        else:
+            config.save_settings_snapshot(settings)
+        config.load_settings()
+        return self.preferences()
+
+    def _import_options(self, payload, category, destination):
+        subversion = payload.get("subversion", False)
+        add_format = payload.get("addFormat", False)
+        if not isinstance(subversion, bool) or not isinstance(add_format, bool):
+            raise HostError("Import options must be true or false")
+        existing = payload.get("targetExisting")
+        if existing and config.SUBVERSION_ENABLED:
+            name = _component(existing, "filename")
+            path, target_category = _file(payload["project"], payload.get("sequence"),
+                                          payload["shot"], payload["targetCategory"], name)
+            if target_category.id != category.id or os.path.normcase(os.path.dirname(path)) != os.path.normcase(destination):
+                raise HostError("Subversion must have the same media category as the selected file")
+            if utils.parse_version_from_filename(name) is None:
+                raise HostError("Fix the selected file name before adding a subversion")
+            subversion = True
+        else:
+            existing = None
+        return {"is_subversion": subversion and config.SUBVERSION_ENABLED,
+                "target_existing_filename": existing, "add_format": add_format}
+
+    def get_structure(self, payload):
+        project = payload.get("project")
+        data = _structure_data()
+        if not project:
+            return {"defaults": _default_structure(data)}
+        project = _component(project, "project")
+        path, layout = _project(project)
+        values = _project_structure(project)
+        values["layout"] = layout
+        return {"defaults": _default_structure(data), "values": values,
+                "custom": project in data.get("projects", {}),
+                "preview": _structure_preview(project, values), "projectRoot": path}
+
+    def preview_structure(self, payload):
+        project = _component(payload.get("project"), "project")
+        values = _validated_structure(payload)
+        return _structure_preview(project, values)
+
+    def set_default_structure(self, payload):
+        values = _validated_structure(payload, defaults=True)
+        def update(data):
+            data = dict(data) if isinstance(data, dict) else {}
+            data["defaults"] = values
+            return data
+        config.update_json_file(_structure_file(), {}, update)
+        return {"defaults": values}
+
+    def set_project_structure(self, payload):
+        project = _component(payload.get("project"), "project")
+        if project not in config.get_projects():
+            raise HostError("Unknown project")
+        values = _validated_structure(payload)
+        def update(data):
+            data = dict(data) if isinstance(data, dict) else {}
+            projects = dict(data.get("projects", {})) if isinstance(data.get("projects"), dict) else {}
+            projects[project] = values
+            data["projects"] = projects
+            return data
+        config.update_json_file(_structure_file(), {}, update)
+        return {"values": values, "preview": _structure_preview(project, values)}
+
+    def reset_project_structure(self, payload):
+        project = _component(payload.get("project"), "project")
+        def update(data):
+            data = dict(data) if isinstance(data, dict) else {}
+            projects = dict(data.get("projects", {})) if isinstance(data.get("projects"), dict) else {}
+            projects.pop(project, None)
+            data["projects"] = projects
+            detected = dict(data.get("detected", {})) if isinstance(data.get("detected"), dict) else {}
+            detected.pop(project, None)
+            data["detected"] = detected
+            return data
+        config.update_json_file(_structure_file(), {}, update)
+        return {"reset": True}
+
+    def choose_project_folder(self, payload):
+        initial = payload.get("initial") or ""
+        if not isinstance(initial, str):
+            raise HostError("Invalid initial folder")
+        return {"path": _choose_project_folder(initial)}
+
+    def _clean_ignored_names(self, names):
         if not isinstance(names, list) or len(names) > 50:
             raise HostError("Provide up to 50 ignored folder names")
         clean = []
@@ -367,6 +784,10 @@ class BrowserHost:
                 raise HostError("Invalid ignored folder name")
             if name.casefold() not in {value.casefold() for value in clean}:
                 clean.append(name)
+        return [name for name in clean if name.casefold() != "_shotcode"]
+
+    def set_ignored_names(self, payload):
+        clean = self._clean_ignored_names(payload.get("names"))
         existing = [item for item in config.get_machine_ignored_folders()
                     if isinstance(item, str) and not ("\\" in item or "/" in item)]
         desired = {item.casefold() for item in clean}
@@ -402,8 +823,15 @@ class BrowserHost:
             raise HostError("Project name already exists")
         projects[name] = folder
         modes = config.get_project_modes()
-        modes[name] = config.detect_project_layout(folder)
+        defaults = _default_structure()
+        modes[name] = (defaults["defaultLayout"] if defaults["defaultLayout"] in config.PROJECT_LAYOUTS
+                       else _detect_layout(folder, defaults))
         config.save_projects(projects, project_modes=modes)
+        if defaults["defaultLayout"] == "auto":
+            try:
+                _remember_layout(name, folder, defaults, modes[name])
+            except OSError:
+                pass
         return {"name": name, "layout": modes[name], "path": folder}
 
     def change_project_path(self, payload):
@@ -434,8 +862,28 @@ class BrowserHost:
         projects[name] = folder
         modes = config.get_project_modes()
         modes.pop(old_name, None)
-        modes[name] = config.detect_project_layout(folder)
+        structure = _project_structure(old_name)
+        explicit_layout = structure.get("layout") or structure.get("defaultLayout")
+        modes[name] = (explicit_layout if explicit_layout in config.PROJECT_LAYOUTS
+                       else _detect_layout(folder, structure))
         config.save_projects(projects, project_modes=modes)
+        if name != old_name:
+            def rename(data):
+                data = dict(data) if isinstance(data, dict) else {}
+                overrides = dict(data.get("projects", {})) if isinstance(data.get("projects"), dict) else {}
+                if old_name in overrides:
+                    overrides[name] = overrides.pop(old_name)
+                    data["projects"] = overrides
+                detected = dict(data.get("detected", {})) if isinstance(data.get("detected"), dict) else {}
+                detected.pop(old_name, None)
+                data["detected"] = detected
+                return data
+            config.update_json_file(_structure_file(), {}, rename)
+        if explicit_layout not in config.PROJECT_LAYOUTS:
+            try:
+                _remember_layout(name, folder, structure, modes[name])
+            except OSError:
+                pass
         return {"name": name, "path": folder, "layout": modes[name]}
 
     def remove_project(self, payload):
@@ -447,6 +895,14 @@ class BrowserHost:
         modes = config.get_project_modes()
         modes.pop(name, None)
         config.save_projects(projects, project_modes=modes)
+        def forget(data):
+            data = dict(data) if isinstance(data, dict) else {}
+            for key in ("projects", "detected"):
+                entries = dict(data.get(key, {})) if isinstance(data.get(key), dict) else {}
+                entries.pop(name, None)
+                data[key] = entries
+            return data
+        config.update_json_file(_structure_file(), {}, forget)
         return {"removed": name}
 
     def navigation(self, payload):
@@ -454,18 +910,24 @@ class BrowserHost:
         path, mode = _project(name)
         if not os.path.isdir(path):
             raise HostError("Project folder unavailable")
-        sequences = _children(config.get_scene_root(path)) if mode == config.PROJECT_LAYOUT_SEQUENCES else []
+        sequences = _children(_sequence_root(path, _project_structure(name))) if mode == config.PROJECT_LAYOUT_SEQUENCES else []
         sequence = payload.get("sequence") or None
         if mode == config.PROJECT_LAYOUT_SEQUENCES and sequence is None:
-            return {"layout": mode, "sequences": sequences, "shots": []}
+            return {"layout": mode, "sequences": sequences, "shots": [],
+                    "categories": [
+                        {"id": cat.id, "folder": cat.folder, "mediaType": cat.media_type,
+                         "typeSuffix": cat.type_suffix} for cat in _categories(name)]}
         _, _, root = _navigation(name, sequence)
-        return {"layout": mode, "sequences": sequences, "shots": _children(root)}
+        return {"layout": mode, "sequences": sequences, "shots": _children(root),
+                "categories": [
+                    {"id": cat.id, "folder": cat.folder, "mediaType": cat.media_type,
+                     "typeSuffix": cat.type_suffix} for cat in _categories(name)]}
 
     def files(self, payload):
         shot_path, _ = _shot(payload["project"], payload.get("sequence"), payload["shot"])
-        target = config.get_target_base(shot_path)
+        target = _target_root(payload["project"], shot_path)
         result = []
-        for category in config.get_media_categories():
+        for category in _categories(payload["project"]):
             folder = os.path.join(target, category.folder)
             try:
                 entries = [entry for entry in os.scandir(folder) if entry.is_file()]
@@ -482,9 +944,19 @@ class BrowserHost:
                     continue
                 record = _media_record(entry.path, category)
                 record["dragUrl"] = self._drag_url(entry.path)
+                # Mint a short-lived capability while the shot is already scanned.
+                # Starting a drag must not enumerate network folders again.
+                token = secrets.token_urlsafe(24)
+                self._direct_files[token] = (entry.path, time.time() + 3600)
+                record["nativeDragToken"] = token
                 record["hasPsd"] = category.id == "keyframes" and _psd_matches(entry.name, psds)
                 result.append(record)
         result.sort(key=lambda item: item["modified"], reverse=True)
+        if len(self._direct_files) > 1000:
+            now = time.time()
+            current = {item["nativeDragToken"] for item in result}
+            self._direct_files = {token: record for token, record in self._direct_files.items()
+                                  if token in current and record[1] > now}
         return {"files": result, "path": target}
 
     def import_file(self, payload):
@@ -495,13 +967,16 @@ class BrowserHost:
         if not file_type:
             raise HostError("Unsupported media type")
         shot_path, _ = _shot(payload["project"], payload.get("sequence"), payload["shot"])
-        category = _category(payload["category"]) if payload.get("category") else config.get_category_for_file_type(file_type)
+        category = (_category(payload["category"], payload["project"])
+                    if payload.get("category") else
+                    _category(config.get_category_for_file_type(file_type).id, payload["project"]))
         if category.file_type != file_type:
             raise HostError("File does not match destination category")
-        target = utils.get_target_directory(shot_path, category=category)
+        target = os.path.join(_ensure_media_folders(payload["project"], shot_path), category.folder)
+        os.makedirs(target, exist_ok=True)
         new_path, new_name, _ = utils.copy_and_rename_file(
             source, target, payload.get("sequence") or "", payload["shot"],
-            file_type, category=category,
+            file_type, category=category, **self._import_options(payload, category, target),
         )
         return {"name": new_name, "path": new_path, "category": category.id}
 
@@ -532,15 +1007,17 @@ class BrowserHost:
                for job in self.conversions.values()):
             raise HostError("Cannot move a video while it is converting")
         target_shot, _ = _shot(payload["project"], payload.get("sequence"), payload["shot"])
-        if os.path.normcase(os.path.abspath(target_shot)) == os.path.normcase(
-            os.path.abspath(os.path.dirname(os.path.dirname(src)))
-        ):
+        source_shot, _ = _shot(payload["sourceProject"], payload.get("sourceSequence"),
+                               payload["sourceShot"])
+        if os.path.normcase(os.path.abspath(target_shot)) == os.path.normcase(os.path.abspath(source_shot)):
             raise HostError("File is already in this shot")
-        target = utils.get_target_directory(target_shot, category=category)
+        destination_category = _category(category.id, payload["project"])
+        target = os.path.join(_ensure_media_folders(payload["project"], target_shot), destination_category.folder)
+        os.makedirs(target, exist_ok=True)
         source_sequence = utils.find_converted_sequence_folder(src) if category.media_type == config.MEDIA_TYPE_VIDEO else ""
         new_path, new_name, _ = utils.copy_and_rename_file(
             src, target, payload.get("sequence") or "", payload["shot"],
-            category.file_type, category=category,
+            category.file_type, category=destination_category,
         )
         staged_sequence = ""
         try:
@@ -628,6 +1105,12 @@ class BrowserHost:
         return {"cancelled": True}
 
     def open_folder(self, payload):
+        if not payload.get("shot"):
+            path, _ = _project(payload["project"])
+            if not os.path.isdir(path):
+                raise HostError("Project folder unavailable")
+            os.startfile(path)
+            return {"opened": True}
         if payload.get("file"):
             path, category = _file(payload["project"], payload.get("sequence"),
                                    payload["shot"], payload["category"], payload["file"])
@@ -644,11 +1127,47 @@ class BrowserHost:
             subprocess.Popen(["explorer.exe", "/select,", path])
             return {"opened": True}
         shot_path, _ = _shot(payload["project"], payload.get("sequence"), payload["shot"])
-        directory = config.get_target_base(shot_path)
+        directory = _target_root(payload["project"], shot_path)
         if not os.path.isdir(directory):
             raise HostError("Folder unavailable")
         os.startfile(directory)
         return {"opened": True}
+
+    def drag_to_app(self, payload):
+        path, _ = _file(payload["project"], payload.get("sequence"),
+                        payload["shot"], payload["category"], payload["name"])
+        _launch_native_drag(path)
+        return {"opened": True}
+
+    def drag_prepare(self, _payload):
+        return self._native_drag.request("ping")
+
+    def drag_status(self, _payload):
+        return dict(self._native_drag.last)
+
+    def drag_stop(self, _payload):
+        self._native_drag.close()
+        return {"stopped": True}
+
+    def drag_probe(self, _payload):
+        report = browser_update.installation_file().parent / "drag-probe.jsonl"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        return self._native_drag.request("probe", str(report))
+
+    def drag_direct(self, payload):
+        issued = payload.get("issued")
+        if not isinstance(issued, (int, float)) or not 0 <= time.time() * 1000 - issued < 750:
+            raise HostError("Native drag request expired. Hover the file, then try again.")
+        token = payload.get("fileToken")
+        if token is not None:
+            record = self._direct_files.get(token) if isinstance(token, str) else None
+            if not record or record[1] < time.time():
+                raise HostError("File drag access expired. Refresh Files and try again.")
+            path = record[0]
+        else:
+            path, _ = _file(payload["project"], payload.get("sequence"),
+                            payload["shot"], payload["category"], payload["name"])
+        return self._native_drag.request("begin", path, issued=issued)
 
     def _preview_path(self, path: str):
         if not os.path.isfile(path):
@@ -706,6 +1225,7 @@ class BrowserHost:
             "destination": {key: payload[key] for key in ("project", "shot")},
             "sequence": payload.get("sequence"),
             "category": payload.get("category"),
+            "options": {key: payload[key] for key in ("subversion", "targetExisting", "targetCategory", "addFormat") if key in payload},
         }
         return {"transferId": transfer_id}
 
@@ -734,6 +1254,7 @@ class BrowserHost:
             destination = dict(item["destination"])
             destination["sequence"] = item["sequence"]
             destination["category"] = item["category"]
+            destination.update(item["options"])
             destination["source"] = item["path"]
             result = self.import_file(destination)
             return result
@@ -763,6 +1284,14 @@ class BrowserHost:
             "start_update": self.start_update,
             "projects": self.projects,
             "preferences": self.preferences,
+            "set_preferences": self.set_preferences,
+            "preview_naming": self.preview_naming,
+            "get_structure": self.get_structure,
+            "preview_structure": self.preview_structure,
+            "set_default_structure": self.set_default_structure,
+            "set_project_structure": self.set_project_structure,
+            "reset_project_structure": self.reset_project_structure,
+            "choose_project_folder": self.choose_project_folder,
             "set_ignored_names": self.set_ignored_names,
             "add_project": self.add_project,
             "change_project_path": self.change_project_path,
@@ -776,6 +1305,12 @@ class BrowserHost:
             "convert_status": self.convert_status,
             "convert_cancel": self.convert_cancel,
             "open_folder": self.open_folder,
+            "drag_to_app": self.drag_to_app,
+            "drag_prepare": self.drag_prepare,
+            "drag_status": self.drag_status,
+            "drag_stop": self.drag_stop,
+            "drag_probe": self.drag_probe,
+            "drag_direct": self.drag_direct,
             "preview": self.preview,
             "preview_download": self.preview_download,
             "transfer_begin": self.transfer_begin,
@@ -810,7 +1345,7 @@ def _read_exact(stream, size):
     return bytes(data)
 
 
-def run(reader=None, writer=None):
+def _run_protocol(reader=None, writer=None):
     reader = reader or sys.stdin.buffer
     writer = writer or sys.stdout.buffer
     host = BrowserHost()
@@ -841,11 +1376,21 @@ def run(reader=None, writer=None):
         host.close()
 
 
+def run(reader=None, writer=None):
+    reader = reader or sys.stdin.buffer
+    writer = writer or sys.stdout.buffer
+    # Shared helpers log to stdout. Keep every diagnostic (including worker
+    # threads) off Chrome's binary channel for the entire host lifetime.
+    with redirect_stdout(sys.stderr):
+        _run_protocol(reader, writer)
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--auto-update"]:
         raise SystemExit(browser_update.run_auto_update(config.get_app_version()))
     if sys.argv[1:] == ["--install-ffmpeg"]:
         try:
+            browser_settings.initialize()
             utils.resolve_ffmpeg(target_path=config.FFMPEG_PATH,
                                  allow_frozen_download=True, timeout=600)
             raise SystemExit(0)
