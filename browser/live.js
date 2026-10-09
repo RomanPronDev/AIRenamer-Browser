@@ -1,15 +1,18 @@
 (() => {
 "use strict";
 const root = document.getElementById("root");
+const {clampPanes,recordRecent,thumbnailKey}=AIRenamerPanelModel;
 const state = {
   connected: false, loading: true, projects: [], categories: [], project: "", layout: "",
   sequences: [], sequence: "", shots: [], shot: "", files: [],
   recent: {downloads: [], managed: []}, tabId: null, windowId: null, query: "",
-  selected: new Set(), modal: null, openMenu: null, busy: false, error: "",
+  selected: new Set(), modal: null, openMenu: null, busy: false, error: "", notice: "",
   generation: 0, theme: "system", paneHeights: {shots:126,files:240}, resizing: null,
   subversionsEnabled:true,createSubversion:false,addFormat:false,importDestination:null,
   mediaExtensions:['.png','.jpg','.jpeg','.tif','.tiff','.webp','.avif','.gif','.exr','.mp4','.mov','.mkv','.webm','.avi','.m4v'],
   conversions: new Map(), setupDismissed: false, desktopDragMode: "native", nativeDragReady: false,
+  platform: "windows", fileManager: "Explorer", projectPathExample: "D:\\Projects\\MyProject", ffmpegStatus: null,
+  recentShots:[],recentVisible:100,focusPath:null,pendingFocus:null,
 };
 let mediaExt = /\.(png|jpe?g|tiff?|webp|avif|gif|exr|mp4|mov|mkv|webm|avi|m4v)$/i;
 const thumbnailCache = new Map();
@@ -28,10 +31,35 @@ async function message(kind, payload = {}) {
   if (!answer?.ok) throw new Error(answer?.error || "Extension is not responding");
   return answer.result;
 }
-const native = (type, payload) => message("native", {type, payload});
+const native = (type, payload, fresh=false) => message("native", {type, payload, fresh});
+let snapshotTimer=null;
+function rememberPanel(){
+  clearTimeout(snapshotTimer);
+  if(!state.connected||state.projectsLoading||state.busy)return;
+  snapshotTimer=setTimeout(()=>{
+    const snapshot={version:chrome.runtime.getManifest().version,project:state.project,sequence:state.sequence,shot:state.shot,
+      projects:state.projects,categories:state.categories,layout:state.layout,sequences:state.sequences,shots:state.shots,
+      files:state.files,platform:state.platform,mediaExtensions:state.mediaExtensions,subversionsEnabled:state.subversionsEnabled,
+      thumbnails:[...thumbnailCache].filter(([,data])=>!(data instanceof Promise)),nativeDragReady:state.nativeDragReady};
+    message('savePanel',{snapshot}).catch(()=>{});
+  },200);
+}
+function constrainPanes(active=null){
+  const navigation=q('.navigation'),shots=q('.shots'),files=q('.files'),app=q('.app');
+  // Measure fixed chrome, including notices and the Recent shots row.
+  const navHeight=navigation?.getBoundingClientRect?.().height,shotHeight=shots?.getBoundingClientRect?.().height;
+  const banners=[...root.querySelectorAll('.app > .connection, .app > .error')]
+    .reduce((sum,node)=>sum+node.getBoundingClientRect().height+5,0);
+  const overhead=Number.isFinite(navHeight)&&Number.isFinite(shotHeight)?39+navHeight-shotHeight+14+banners:150+banners;
+  const heights=clampPanes(state.paneHeights,window.innerHeight,overhead,active,!!state.shot);
+  state.paneHeights.shots=heights.shots;
+  if(state.shot)state.paneHeights.files=heights.files;
+  app?.style.setProperty('--shots-height',heights.shots+'px');
+  app?.style.setProperty('--files-height',heights.files+'px');
+}
 function status(error) {
   const message = String(error?.message || error || "");
-  if (["settings","setup","project-path","structure","connect-files"].includes(state.modal?.kind)) {
+  if (["settings","setup","project-path","structure","connect-files","new-shot"].includes(state.modal?.kind)) {
     state.modal.error = message;
     state.error = "";
   } else state.error = message;
@@ -68,9 +96,9 @@ function fileRows() {
     if (!items.length&&['keyframes','video'].includes(category.id)) return "";
     return '<section class="category" data-drop-category="'+esc(category.id)+'"><div class="section-title">'+esc(category.folder)+'<span>'+items.length+'</span>'+
       '<button class="icon-button" data-action="import" data-category="'+esc(category.id)+'" aria-label="Add files to '+esc(category.folder)+'">'+icon('plus')+'</button></div>'+
-      items.map(item => '<div class="file-row" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" draggable="true">'+
+      items.map(item => '<div class="file-row media-'+(category.mediaType==='video'?'video':'image')+(state.focusPath===item.path?' focused':'')+'" tabindex="-1" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" draggable="true">'+
       '<label class="file-check"><input type="checkbox" data-select="'+esc(key(item))+'" '+(state.selected.has(key(item))?"checked":"")+' aria-label="Select '+esc(item.name)+'"></label>'+
-      '<div class="file-icon">'+icon(category.mediaType==="video"?"film":"image")+'</div>'+
+      '<button class="file-icon file-thumb" data-action="load-file-thumbnail" data-thumbnail="'+esc(thumbnailKey(item))+'" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Load preview of '+esc(item.name)+'" title="Load preview">'+icon(category.mediaType==="video"?"film":"image")+'</button>'+
       '<div class="file-data"><button class="file-name" data-action="preview" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'">'+esc(item.name)+'</button>'+
       '<div class="file-sub">'+(item.version!==null?'v'+String(item.version).padStart(3,"0"):"No version")+
       (item.subversion ? ' · '+String(item.subversion).padStart(2,"0") : "")+
@@ -79,21 +107,24 @@ function fileRows() {
       (state.desktopDragMode==='native'?
       '<button class="icon-button shot-drag-handle" draggable="true" data-internal-drag="true" aria-label="Drag '+esc(item.name)+' to another shot" title="Drag to another shot">'+icon("move")+'</button>':
       '<button class="icon-button" data-action="drag-to-app" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Drag '+esc(item.name)+' into a desktop app" title="Drag into desktop app">'+icon("external")+'</button>')+
-      '<button class="icon-button folder-shortcut" data-action="open-folder" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Show '+esc(item.name)+' in Explorer" title="Show in Explorer">'+icon("folder")+'</button>'+
+      '<button class="icon-button copy-shortcut" data-action="copy-path" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Copy file path" title="Copy file path">'+icon('copy')+'</button>'+
+      '<button class="icon-button folder-shortcut" data-action="open-folder" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Show '+esc(item.name)+' in '+state.fileManager+'" title="Show in '+state.fileManager+'">'+icon("folder")+'</button>'+
       '<button class="icon-button" data-action="file-menu" data-category="'+esc(item.category)+'" data-name="'+esc(item.name)+'" aria-label="Actions for '+esc(item.name)+'">⋯</button></div>').join("")+'</section>';
   }).join("");
 }
 function recentRows() {
+  const assigned=new Map((state.recent.managed||[]).map(item=>[item.id,item]));
   const items=state.recent.downloads.map(item=>({
     id:"d"+item.id,downloadId:item.id,
     name:item.filename?.split(/[\\/]/).pop()||item.url?.split("/").pop()||"Download",
     state:item.state==="complete"?"complete":item.state==="interrupted"?"error":"working",
     source:(()=>{try{return new URL(item.finalUrl||item.url).hostname;}catch{return "Chrome";}})(),
     path:item.filename,error:item.error,
+    assigned:(()=>{const record=assigned.get(item.id);return record?.source===item.filename&&(record.startTime||'')===(item.startTime||'')?record:null;})(),
   }));
-  return {count:items.length,html:items.length?items.map(item=>{
+  return {count:items.length,html:items.length?items.slice(0,state.recentVisible).map(item=>{
     const media=item.path&&mediaExt.test(item.path);
-    return '<div class="recent-row"><span class="recent-state '+esc(item.state)+'"></span>'+
+    return '<div class="recent-row'+(item.assigned?' assigned-download':'')+'" '+(item.assigned?'title="Saved to '+esc([item.assigned.project,item.assigned.sequence,item.assigned.shot].filter(Boolean).join(' / '))+'"':'')+'><span class="recent-state '+esc(item.state)+'"></span>'+
       (item.state==="complete"&&media?
         '<button class="recent-thumb" data-action="load-thumbnail" data-recent="'+esc(item.id)+'" data-recent-id="'+esc(item.id)+'" aria-label="Load preview of '+esc(item.name)+'" title="Load preview">'+icon("image")+'</button>':
         '<span class="recent-thumb">'+icon("download")+'</span>')+
@@ -103,26 +134,62 @@ function recentRows() {
       '<small>'+esc(item.source)+(item.state==="working"?" · downloading":item.state==="error"?" · "+esc(item.error||"error"):"")+'</small></div>'+
       (item.state==="complete"&&state.shot&&media?
        '<button class="small-action" data-action="assign-download" data-id="'+item.downloadId+'">To shot</button>':"")+'</div>';
-  }).join(""):'<div class="empty compact">No downloads yet.</div>'};
+  }).join("")+(items.length>state.recentVisible?'<button class="more-downloads small-action" data-action="more-downloads">Show more downloads</button>':''):'<div class="empty compact">No downloads yet.</div>'};
 }
 function thumbnailItem(id){return state.recent.downloads.find(item=>"d"+item.id===id);}
+function cachedThumbnail(id){
+  const data=thumbnailCache.get(id);
+  if(data?.mediaType==='video'&&data.expiresAt<=Date.now()){
+    thumbnailCache.delete(id);return null;
+  }
+  return data;
+}
 function paintCachedThumbnails(){
   root.querySelectorAll(".recent-thumb").forEach(node=>{
-    const data=thumbnailCache.get(node.dataset.recentId);
+    const data=cachedThumbnail(node.dataset.recentId);
     if(data&&!(data instanceof Promise))paintThumbnail(node,data);
   });
+  root.querySelectorAll('.file-thumb').forEach(node=>{
+    const data=cachedThumbnail(node.dataset.thumbnail);
+    if(data&&!(data instanceof Promise))paintThumbnail(node,data);
+  });
+}
+function cacheThumbnail(id,data){
+  if(data.mediaType==='video'){
+    data={...data,expiresAt:data.expiresAt||Date.now()+300000};
+    if(data.expiresAt<=Date.now())return;
+  }
+  thumbnailCache.delete(id);thumbnailCache.set(id,data);
+  while(thumbnailCache.size>24||JSON.stringify([...thumbnailCache]).length>1024*1024)
+    thumbnailCache.delete(thumbnailCache.keys().next().value);
+  rememberPanel();
+}
+async function loadFileThumbnail(category,name){
+  const item=state.files.find(file=>file.category===category&&file.name===name);
+  if(!item)throw new Error('File is unavailable');
+  const id=thumbnailKey(item);
+  if(cachedThumbnail(id))return cachedThumbnail(id);
+  const nodes=[...root.querySelectorAll('.file-thumb')].filter(node=>node.dataset.thumbnail===id);
+  for(const node of nodes){node.classList.add('loading');node.setAttribute('aria-busy','true');}
+  const destination=currentDestination();
+  const pending=native('preview',{...destination,category,name}).then(data=>{
+    cacheThumbnail(id,data);paintCachedThumbnails();return data;
+  }).catch(error=>{thumbnailCache.delete(id);throw error;}).finally(()=>{
+    for(const node of nodes){node.classList.remove('loading');node.removeAttribute('aria-busy');}
+  });
+  thumbnailCache.set(id,pending);return pending;
 }
 function loadRecentThumbnail(id){
   const item=thumbnailItem(id);
   if(!item||item.state!=="complete"||!item.filename||!mediaExt.test(item.filename))
     throw new Error("Preview is unavailable for this file");
-  if(thumbnailCache.has(id))return thumbnailCache.get(id);
+  if(cachedThumbnail(id))return cachedThumbnail(id);
   for(const node of root.querySelectorAll('.recent-thumb[data-recent-id="'+id+'"]')){
     node.classList.add("loading");
     node.setAttribute("aria-busy","true");
   }
   const pending=native("preview_download",{path:item.filename}).then(data=>{
-    thumbnailCache.set(id,data);
+    cacheThumbnail(id,data);
     for(const node of root.querySelectorAll('.recent-thumb[data-recent-id="'+id+'"]')){
       node.classList.remove("loading");
       node.removeAttribute("aria-busy");
@@ -232,15 +299,22 @@ function modalHtml() {
   const modal = state.modal;
   const heading = modal.kind==="settings"?"Settings":modal.kind==="setup"?"Add your first project":
     modal.kind==="project-path"?(modal.project?"Change project folder":"Add project folder"):
-    modal.kind==="connect-files"?"Connect folder for drag":
+    modal.kind==="connect-files"?"Connect folder for drag":modal.kind==="new-shot"?"New shot":
     modal.kind==="structure"?(modal.project?"Project structure":"Default structure"):
     modal.kind==="remove-project"?"Remove project shortcut":modal.kind==="preview"?"Preview":
     modal.kind==="move"?(modal.items?.length>1?"Move "+modal.items.length+" files":"Move file"):"File actions";
   let body = "";
   const projectPathField = '<label>Project folder path<div class="project-path-row">'+
-    '<input id="project-folder-input" type="text" spellcheck="false" autocomplete="off" placeholder="D:\\Projects\\MyProject" value="'+esc(modal.path||"")+'">'+
+    '<input id="project-folder-input" type="text" spellcheck="false" autocomplete="off" placeholder="'+esc(state.projectPathExample)+'" value="'+esc(modal.path||"")+'">'+
     '<button class="small-action" data-action="browse-project-folder" type="button" '+(modal.browsing||modal.busy?'disabled':'')+'>'+(modal.browsing?'Opening…':'Browse…')+'</button></div></label>';
-  if (modal.kind==="settings") {
+  if (modal.kind==="new-shot") {
+    body = '<p>'+esc(modal.project)+(modal.sequence?' / '+esc(modal.sequence):'')+'</p>'+
+      '<label>Shot name<input id="new-shot-name" type="text" spellcheck="false" autocomplete="off" placeholder="SH020" value="'+esc(modal.shot)+'" '+(modal.busy?'disabled':'')+'></label>'+
+      '<p class="menu-file">'+esc(modal.info.shotsRoot)+'</p>'+
+      '<p class="hint">Creates the shot and '+esc(modal.info.mediaFolders.join(' and '))+
+      (modal.info.mediaPrefix?' inside '+esc(modal.info.mediaPrefix):'')+'. Folder paths follow this project’s settings.</p>'+
+      '<button class="primary wide" data-action="create-shot" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Creating…':'Create shot')+'</button>';
+  } else if (modal.kind==="settings") {
     body = '<div class="settings-section"><div class="section-title">PROJECT FOLDERS</div>'+
       (state.projects.length?state.projects.map(project=>{
         const nested=project.path.match(/[\\/]vfx[\\/]shots[\\/]?$/i);
@@ -255,7 +329,7 @@ function modalHtml() {
         '<button data-action="change-project-path" data-project="'+esc(project.name)+'">Change folder</button>'+
         '<button data-action="ask-remove-project" data-project="'+esc(project.name)+'" aria-label="Remove '+esc(project.name)+' shortcut">Remove</button></div></div>');
       }).join(''):
-        '<p class="hint">Paste a project root folder path copied from Explorer.</p>')+
+        '<p class="hint">Paste a project root folder path copied from '+state.fileManager+'.</p>')+
       '<button class="small-action" data-action="new-project-path">'+icon("plus")+' Add project folder</button></div>'+
       '<div class="settings-section"><div class="section-title">FOLDER STRUCTURE</div>'+
       '<p class="hint">Default shots tree: Project / vfx / shots / [Sequence] / Shot</p>'+
@@ -267,6 +341,9 @@ function modalHtml() {
       '<option value="browser" '+((modal.dragMode||state.desktopDragMode)==='browser'?'selected':'')+'>Chrome folder connection</option></select></label>'+
       '<p class="hint">Drag a file row directly into an app. Native drag starts automatically and needs no folder connection. Use the move handle beside a file to drag it to another shot. The file menu retains the fallback drag window.</p>'+
       '<button class="small-action" data-action="drag-probe">Open drag test target</button>'+
+      '<div class="settings-section"><div class="section-title">VIDEO TOOLS</div>'+
+        '<p class="hint" id="ffmpeg-status" role="status">'+esc(ffmpegStatusText())+'</p>'+
+        '<button class="small-action" data-action="setup-ffmpeg">Prepare / retry video tools</button></div>'+
       '<label>Theme<select id="theme-setting">'+
       ['system','light','dark'].map(value=>'<option value="'+value+'" '+(state.theme===value?'selected':'')+'>'+value[0].toUpperCase()+value.slice(1)+'</option>').join('')+
       '</select></label><label>Ignored folder names<textarea id="ignored-names" rows="3" spellcheck="false" placeholder="One name per line">'+
@@ -277,16 +354,16 @@ function modalHtml() {
     const project=state.projects.find(item=>item.name===modal.project);
     body='<p>Experimental direct file drag from this Chrome panel.</p>'+
       '<div class="folder-connect" data-connect-folder="'+esc(modal.project)+'"><strong>Drop the project folder here</strong><code>'+esc(project?.path)+'</code></div>'+
-      '<p class="hint">Drag the root folder from Explorer. Files stay on disk; only the file under your pointer is prepared. Reconnect after closing this panel.</p>'+
+      '<p class="hint">Drag the root folder from '+state.fileManager+'. Files stay on disk; only the file under your pointer is prepared. Reconnect after closing this panel.</p>'+
       (localFiles?.connected(project)?'<p class="hint">Connected for this panel session.</p>':'')+
-      '<button class="small-action" data-action="open-project-folder" data-project="'+esc(modal.project)+'">Show project folder in Explorer</button>';
+      '<button class="small-action" data-action="open-project-folder" data-project="'+esc(modal.project)+'">Show project folder in '+state.fileManager+'</button>';
   } else if (modal.kind==="setup") {
-    body = '<p>Choose a project root folder, or paste its path from Explorer.</p>'+
+    body = '<p>Choose a project root folder, or paste its path from '+state.fileManager+'.</p>'+
       projectPathField+
       '<button class="primary wide" data-action="save-project-path" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Adding project…':'Add project')+'</button>'+
       '<p class="hint">You can add more project folders later in Settings.</p>';
   } else if (modal.kind==="project-path") {
-    body = '<p>'+esc(modal.project?"Choose a new root folder for "+modal.project+", or paste its path.":"Choose a project root folder, or paste its path from Explorer.")+'</p>'+
+    body = '<p>'+esc(modal.project?"Choose a new root folder for "+modal.project+", or paste its path.":"Choose a project root folder, or paste its path from "+state.fileManager+".")+'</p>'+
       projectPathField+
       '<p class="hint">The folder must already exist. AIRenamer will detect its sequences and shots.</p>'+
       '<button class="primary wide" data-action="save-project-path" '+(modal.busy?'disabled':'')+'>'+(modal.busy?'Saving…':modal.project?'Save folder path':'Add project')+'</button>';
@@ -359,13 +436,18 @@ function navigationHtml() {
   const shots = filteredShots.map(shot=>
     '<button class="shot '+(shot===state.shot?'active':'')+'" data-action="shot" data-shot="'+esc(shot)+'" aria-pressed="'+(shot===state.shot)+'" title="'+esc(shot)+'">'+esc(shot)+'</button>'
   ).join("");
+  const recent=state.recentShots.map((item,index)=>state.projects.some(project=>project.name===item.project)?
+    '<button class="recent-shot '+(item.project===state.project&&(item.sequence||'')===(state.sequence||'')&&item.shot===state.shot?'active':'')+'" data-action="recent-shot" data-index="'+index+'" title="'+esc([item.project,item.sequence,item.shot].filter(Boolean).join(' / '))+'">'+esc(item.shot)+'</button>':'').join('');
   return '<section class="navigation"><div class="nav-pickers">'+projects+sequences+'</div>'+
-    (state.project?'<div class="shot-tools"><span>SHOTS <b>'+state.shots.length+'</b></span><div class="search">'+icon("search")+'<input id="shot-search" type="search" placeholder="Find shot" aria-label="Find shot" value="'+esc(state.query)+'"></div></div>'+
+    (recent?'<div class="recent-shots" aria-label="Recently used shots"><span>Recent</span><div>'+recent+'</div></div>':'')+
+    (state.project?'<div class="shot-tools"><span>SHOTS <b>'+state.shots.length+'</b></span><div class="search">'+icon("search")+'<input id="shot-search" type="search" placeholder="Find shot" aria-label="Find shot" value="'+esc(state.query)+'"></div>'+
+      '<button class="icon-button" data-action="new-shot" aria-label="Create shot" title="New shot" '+(state.busy||state.layout==='sequences'&&!state.sequence?'disabled':'')+'>'+icon('plus')+'</button></div>'+
       '<div class="shots">'+(shots||'<div class="shot-empty">'+(state.query?'No shots match this search. <button data-action="clear-shot-search">Clear search</button>':(state.layout==="sequences"&&!state.sequence?'Select a sequence to view shots.':'No shots in this location.'))+'</div>')+'</div>':"")+
     (!state.projects.length&&!state.loading?'<div class="empty compact">Choose a project folder in Settings.</div>':"")+
     '</section>';
 }
 function render() {
+  const scrolls={files:q('.file-list')?.scrollTop||0,recent:q('.recent-list')?.scrollTop||0,shots:q('.shots')?.scrollTop||0};
   const recent = recentRows();
   document.documentElement.dataset.theme=state.theme==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":state.theme;
   root.innerHTML = '<main class="app" style="--shots-height:'+state.paneHeights.shots+'px;--files-height:'+state.paneHeights.files+'px">'+
@@ -374,9 +456,12 @@ function render() {
     (state.loading?'<div class="connection loading" role="status"><span>Loading</span><span class="loading-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>':
     !state.connected?'<div class="connection offline"><span class="dot"></span>Connection unavailable<button data-action="refresh" aria-label="Refresh">'+icon("refresh")+'</button></div>':"")+
     (state.error?'<div class="error" role="alert">'+icon("alert")+'<span>'+esc(state.error)+'</span><button data-action="dismiss" aria-label="Dismiss error">×</button></div>':"")+
+    (state.notice?'<div class="connection" role="status">'+esc(state.notice)+'<button data-action="dismiss-notice" aria-label="Dismiss message">×</button></div>':'')+
     navigationHtml()+'<div class="pane-handle" data-resize="shots" role="separator" aria-label="Resize Shots" title="Drag to resize Shots"></div>'+
     (state.shot?'<section class="files"><div class="section-title">FILES <span>'+state.files.length+'</span>'+
+    '<button class="icon-button copy-header" data-action="copy-selected-path" aria-label="Copy selected file path" title="Copy selected file path" '+(selectedFiles().length!==1&&!state.files.some(file=>file.path===state.focusPath)?'disabled':'')+'>'+icon('copy')+'</button>'+
     '<button class="icon-button" data-action="refresh-files" aria-label="Refresh files">'+icon("refresh")+'</button>'+
+    '<button class="icon-button" data-action="create-media-folders" aria-label="Create media folders" title="Create media folders" '+(state.busy?'disabled':'')+'>'+icon("folder")+'</button>'+
     '<button class="icon-button inline-import" data-action="import" aria-label="Add files to '+esc(state.shot)+'" title="Add files">'+icon("plus")+'</button></div>'+
     '<button class="drag-connection" data-action="'+(state.desktopDragMode==='native'?'settings':'connect-files')+'" data-project="'+esc(state.project)+'">'+
     (state.desktopDragMode==='native'?(state.nativeDragReady?'Drag a file into an app · Move handle for shots':'Preparing native drag…'):
@@ -394,6 +479,15 @@ function render() {
     '<input type="file" id="file-picker" multiple accept="'+esc(state.mediaExtensions.join(','))+'" hidden>'+
     modalHtml()+'</main>';
   paintCachedThumbnails();
+  constrainPanes(state.resizing?.pane);
+  for(const [name,selector] of [['files','.file-list'],['recent','.recent-list'],['shots','.shots']]){
+    const node=q(selector);if(node)node.scrollTop=scrolls[name];
+  }
+  if(state.pendingFocus){
+    const row=[...root.querySelectorAll('.file-row')].find(node=>fileForRow(node)?.path===state.pendingFocus);
+    if(row){row.scrollIntoView({block:'center',inline:'nearest'});row.focus({preventScroll:true});state.pendingFocus=null;}
+  }
+  rememberPanel();
 }
 function fileForRow(row) {
   return state.files.find(file=>file.category===row.dataset.category&&file.name===row.dataset.name);
@@ -449,20 +543,23 @@ function warmNativeDrag() {
     .finally(()=>{warmingNativeDrag=null;});
   return warmingNativeDrag;
 }
-async function refreshProjects({quiet=false,throwOnError=false}={}) {
+async function refreshProjects({quiet=false,throwOnError=false,fresh=false}={}) {
   state.projectsLoading=(state.projectsLoading||0)+1;
   if(!state.connected){state.loading=true;render();}
   const token=++state.generation;
   try {
-    const data=await native("projects");
+    const data=await native("projects",{},fresh);
     if(token!==state.generation)return;
     state.connected=true;state.loading=false;state.error="";
+    if(data.platform==='macos'||data.platform==='windows')state.platform=data.platform;
+    state.fileManager=state.platform==='macos'?'Finder':'Explorer';
+    if(typeof data.projectPathExample==='string')state.projectPathExample=data.projectPathExample;
     state.projects=data.projects;state.categories=data.categories;
     if(data.preferences)applyPreferences(data.preferences);
     if(!state.projects.some(p=>p.name===state.project)){state.project="";state.sequence="";state.shot="";state.files=[];}
     if(!state.projects.length&&!state.modal&&!state.setupDismissed)state.modal={kind:"setup"};
     render();
-    if(state.project)await refreshNavigation();
+    if(state.project)await refreshNavigation(fresh);
   } catch(error) {
     if(token!==state.generation)return;
     state.connected=false;state.loading=false;
@@ -471,12 +568,13 @@ async function refreshProjects({quiet=false,throwOnError=false}={}) {
     if(throwOnError)throw error;
   } finally {
     state.projectsLoading--;
+    rememberPanel();
   }
 }
-async function refreshNavigation() {
+async function refreshNavigation(fresh=false) {
   const token=++state.generation;
   try {
-    const initial=await native("navigation",{project:state.project});
+    const initial=await native("navigation",{project:state.project},fresh);
     if(token!==state.generation)return;
     state.layout=initial.layout;state.sequences=initial.sequences;
     if(initial.categories)state.categories=initial.categories;
@@ -489,7 +587,7 @@ async function refreshNavigation() {
         await saveDestination();
       }
       if(state.sequence){
-        const details=await native("navigation",{project:state.project,sequence:state.sequence});
+        const details=await native("navigation",{project:state.project,sequence:state.sequence},fresh);
         if(token!==state.generation)return;
         state.shots=details.shots;
       }else state.shots=[];
@@ -498,14 +596,14 @@ async function refreshNavigation() {
     }
     if(!state.shots.includes(state.shot)){state.shot="";state.files=[];}
     render();
-    if(state.shot)await refreshFiles();
+    if(state.shot)await refreshFiles(fresh);
   }catch(error){if(token===state.generation)status(error);}
 }
-async function refreshFiles() {
+async function refreshFiles(fresh=false) {
   if(!state.shot)return;
   const token=++state.generation, destination=currentDestination();
   try {
-    const data=await native("files",destination);
+    const data=await native("files",destination,fresh);
     if(token!==state.generation)return;
     state.files=data.files;
     const available=new Set(data.files.map(key));
@@ -527,6 +625,7 @@ async function saveDestination() {
   await Promise.all(writes);
 }
 async function selectProject(project) {
+  state.notice="";
   state.openMenu=null;state.project=project;state.layout="";
   state.sequence="";state.shot="";state.sequences=[];state.shots=[];
   state.files=[];state.query="";state.selected.clear();
@@ -534,15 +633,35 @@ async function selectProject(project) {
   if(project)await refreshNavigation();
 }
 async function selectSequence(sequence) {
+  state.notice="";
   state.openMenu=null;state.sequence=sequence;state.shot="";
   state.shots=[];state.files=[];state.query="";state.selected.clear();
   await saveDestination();render();
   if(state.project)await refreshNavigation();
 }
 async function chooseShot(shot) {
+  state.notice="";
   state.shot=shot;state.files=[];state.query="";state.selected.clear();
+  state.focusPath=null;state.recentShots=recordRecent(state.recentShots,currentDestination());
+  await chrome.storage.local.set({recentShots:state.recentShots});
   await saveDestination();
   render();await refreshFiles();
+}
+async function selectRecentShot(index){
+  const item=state.recentShots[index];if(!item)return;
+  if(item.project!==state.project)await selectProject(item.project);
+  if((item.sequence||'')!==(state.sequence||''))await selectSequence(item.sequence||'');
+  if(!state.shots.includes(item.shot))throw new Error('This recent shot is unavailable. Refresh the project or check its folders.');
+  await chooseShot(item.shot);
+}
+async function revealFile(destination,result){
+  if(destination.project!==state.project)await selectProject(destination.project);
+  if((destination.sequence||'')!==(state.sequence||''))await selectSequence(destination.sequence||'');
+  if(!state.shots.includes(destination.shot))await refreshNavigation(true);
+  if(destination.shot!==state.shot)await chooseShot(destination.shot);
+  else await refreshFiles(true);
+  const item=state.files.find(file=>result?.path?file.path===result.path:file.name===result?.name&&(!result.category||file.category===result.category));
+  if(item){state.focusPath=item.path;state.pendingFocus=item.path;render();}
 }
 function setBusy(value){state.busy=value;render();}
 async function transferFile(file, destination={...currentDestination(),...importOptions()}) {
@@ -572,8 +691,9 @@ async function importFiles(files, destination=currentDestination()) {
     destination={...destination,...importOptions(),...destination};
     const chosen=[...files].filter(file=>mediaExt.test(file.name));
     if(chosen.length!==files.length)throw new Error("Some files use an unsupported format");
-    for(const file of chosen)await transferFile(file,destination);
-    if(destination?.project===state.project&&destination?.sequence===(state.sequence||null)&&destination?.shot===state.shot)await refreshFiles();
+    let result;
+    for(const file of chosen)result=await transferFile(file,destination);
+    if(result)await revealFile(destination,result);
   }catch(error){status(error);}
   finally{setBusy(false);}
 }
@@ -582,6 +702,34 @@ async function openSettings() {
   const data=await native("preferences");
   applyPreferences(data);
   state.modal={kind:"settings",ignoredNames:data.ignoredNames,settings:data.settings||structuredNamingDefaults(),preview:data.preview};render();
+  watchFfmpegSetup();
+}
+function ffmpegStatusText() {
+  const value=state.ffmpegStatus;
+  if(!value||value.state==='missing')return 'Video tools will download automatically when needed. An existing local FFmpeg is reused.';
+  if(value.state==='ready')return 'Video tools are ready.'+(value.path?' '+value.path:'');
+  if(value.state==='error')return 'Video tools could not be prepared: '+(value.error||'Please retry.');
+  if(value.state==='downloading')return 'Downloading video tools… '+Math.round((value.bytes||0)/1048576)+' MB'+
+    (value.total?' / '+Math.round(value.total/1048576)+' MB':'');
+  return 'Checking video tools…';
+}
+let ffmpegPollTimer=null;
+async function watchFfmpegSetup(started=Date.now()) {
+  clearTimeout(ffmpegPollTimer);
+  const modal=state.modal;
+  if(modal?.kind!=='settings')return;
+  try {
+    const value=await native('ffmpeg_status');
+    if(state.modal!==modal)return;
+    state.ffmpegStatus=value;
+    const label=q('#ffmpeg-status');if(label)label.textContent=ffmpegStatusText();
+    const button=q('[data-action="setup-ffmpeg"]');
+    if(button)button.disabled=['queued','checking','downloading','verifying'].includes(value.state);
+    if(['queued','checking','downloading','verifying'].includes(value.state)&&Date.now()-started<900000)
+      ffmpegPollTimer=setTimeout(()=>watchFfmpegSetup(started),1000);
+  }catch(error){
+    if(state.modal===modal){const label=q('#ffmpeg-status');if(label)label.textContent=String(error.message||error);}
+  }
 }
 function structureForm() {
   return {scenePrefix:q('#structure-scene').value.trim(),
@@ -593,7 +741,7 @@ function structureForm() {
 }
 async function showPreview(category,name) {
   try {
-    const data=await native("preview",{...currentDestination(),category,name});
+    const data=await loadFileThumbnail(category,name);
     state.modal={kind:"preview",category,name,data};render();
   }catch(error){status(error);}
 }
@@ -652,12 +800,52 @@ root.addEventListener("click",async event=>{
   const action=button.dataset.action;
   try {
     if(action==="dismiss"){state.error="";render();}
-    else if(action==="refresh")await refreshProjects();
-    else if(action==="refresh-files")await refreshFiles();
+    else if(action==="dismiss-notice"){state.notice="";render();}
+    else if(action==="refresh")await refreshProjects({fresh:true});
+    else if(action==="refresh-files")await refreshFiles(true);
+    else if(action==='recent-shot')await selectRecentShot(Number(button.dataset.index));
+    else if(action==='more-downloads'){state.recentVisible+=100;render();}
     else if(action==="toggle-projects"){state.openMenu=state.openMenu==="project"?null:"project";render();}
     else if(action==="toggle-sequences"){state.openMenu=state.openMenu==="sequence"?null:"sequence";render();}
     else if(action==="select-project")await selectProject(button.dataset.project);
     else if(action==="select-sequence")await selectSequence(button.dataset.sequence);
+    else if(action==="new-shot"){
+      if(state.busy||!state.project)return;
+      const project=state.project,sequence=state.sequence||null;
+      const info=await native('shot_creation_info',{project,sequence});
+      if(state.project!==project||(state.sequence||null)!==sequence)return;
+      state.modal={kind:'new-shot',project,sequence,shot:'',info};render();q('#new-shot-name')?.focus();
+    }
+    else if(action==="create-shot"){
+      const modal=state.modal;
+      if(modal?.kind!=='new-shot'||modal.busy)return;
+      modal.shot=q('#new-shot-name')?.value.trim()||modal.shot.trim();
+      if(!modal.shot)throw new Error('Enter a shot name');
+      modal.busy=true;modal.error='';render();
+      try{
+        const result=await native('create_shot',{project:modal.project,sequence:modal.sequence,shot:modal.shot});
+        if(state.modal===modal)state.modal=null;
+        if(state.project===modal.project&&(state.sequence||null)===modal.sequence){
+          await refreshNavigation();
+          if(state.project===modal.project&&(state.sequence||null)===modal.sequence){
+            if(state.shots.includes(result.shot))await chooseShot(result.shot);
+            state.notice='Shot '+result.shot+' created.';
+          }
+        }
+      }finally{modal.busy=false;render();}
+    }
+    else if(action==="create-media-folders"){
+      const destination=currentDestination();
+      if(state.busy||!destination)return;
+      state.error='';state.notice='';setBusy(true);
+      try{
+        const result=await native('create_media_folders',destination);
+        if(JSON.stringify(currentDestination())===JSON.stringify(destination)){
+          await refreshFiles();
+          state.notice='Media folders ready: '+result.folders.map(path=>path.split(/[\\/]/).pop()).join(' · ');
+        }
+      }finally{setBusy(false);}
+    }
     else if(action==="new-project-path"){
       state.modal={kind:"project-path",path:""};render();
     }
@@ -770,6 +958,15 @@ root.addEventListener("click",async event=>{
     else if(action==="drag-probe"){
       await native('drag_probe',{});state.modal=null;render();
     }
+    else if(action==="setup-ffmpeg"){
+      button.disabled=true;
+      try {
+        await native('ffmpeg_setup');
+        state.ffmpegStatus={state:'downloading',bytes:0};
+        const label=q('#ffmpeg-status');if(label)label.textContent=ffmpegStatusText();
+        ffmpegPollTimer=setTimeout(()=>watchFfmpegSetup(),1000);
+      }catch(error){button.disabled=false;throw error;}
+    }
     else if(action==="open-project-folder"){
       await native("open_folder",{project:button.dataset.project});
     }
@@ -833,6 +1030,12 @@ root.addEventListener("click",async event=>{
     }
     else if(action==="file-menu"){state.modal={kind:"menu",category:button.dataset.category,name:button.dataset.name};render();}
     else if(action==="preview")await showPreview(button.dataset.category,button.dataset.name);
+    else if(action==='load-file-thumbnail')await loadFileThumbnail(button.dataset.category,button.dataset.name);
+    else if(action==='copy-selected-path'){
+      const file=selectedFiles().length===1?selectedFiles()[0]:state.files.find(file=>file.path===state.focusPath);
+      if(!file)throw new Error('Select one file to copy its path.');
+      await navigator.clipboard.writeText(file.path);state.notice='File path copied.';render();
+    }
     else if(action==="convert-png"){
       const file=state.files.find(item=>item.category===button.dataset.category&&item.name===button.dataset.name);
       if(!file||file.converted)throw new Error("Video is unavailable for conversion");
@@ -853,7 +1056,7 @@ root.addEventListener("click",async event=>{
       const file=state.files.find(item=>item.category===button.dataset.category&&item.name===button.dataset.name);
       if(!file?.path)throw new Error("File path is unavailable");
       await navigator.clipboard.writeText(file.path);
-      state.modal=null;render();
+      state.modal=null;state.notice='File path copied.';render();
     }
     else if(action==="copy-sequence-path"){
       const file=state.files.find(item=>item.category===button.dataset.category&&item.name===button.dataset.name);
@@ -891,18 +1094,20 @@ root.addEventListener("click",async event=>{
       if(m.project===state.project&&(m.sequence||null)===(state.sequence||null)&&m.shot===state.shot)
         throw new Error("Choose a different shot");
       let moved=0;
+      let result;
+      const source=currentDestination();
       setBusy(true);
       try{
         for(const item of items){
-          await native("move_file",{
-            sourceProject:state.project,sourceSequence:state.sequence||null,sourceShot:state.shot,
+          result=await native("move_file",{
+            sourceProject:source.project,sourceSequence:source.sequence,sourceShot:source.shot,
             category:item.category,name:item.name,project:m.project,sequence:m.sequence||null,shot:m.shot,
           });
           state.selected.delete(key(item));
           moved++;
         }
         state.modal=null;
-        await refreshFiles();
+        await revealFile({project:m.project,sequence:m.sequence||null,shot:m.shot},result);
       }catch(error){
         state.modal=null;
         await refreshFiles().catch(()=>{});
@@ -912,8 +1117,10 @@ root.addEventListener("click",async event=>{
     else if(action==="assign-download"){
       const item=state.recent.downloads.find(x=>x.id===Number(button.dataset.id));
       if(!item||item.state!=="complete")throw new Error("Download is unavailable");
-      await native("import_file",{...currentDestination(),source:item.filename,...importOptions()});
-      await refreshFiles();
+      const destination=currentDestination();
+      const result=await native("import_file",{...destination,source:item.filename,downloadId:item.id,...importOptions()});
+      await refreshRecent();
+      await revealFile(destination,result);
     }
   }catch(error){status(error);}
 });
@@ -934,6 +1141,9 @@ root.addEventListener("change",async event=>{
   }catch(error){status(error);}
 });
 root.addEventListener("input",event=>{
+  if(event.target.id==='new-shot-name'&&state.modal?.kind==='new-shot'){
+    state.modal.shot=event.target.value;return;
+  }
   if(event.target.dataset.preference||event.target.dataset.categoryField){scheduleNamingPreview();return;}
   if(event.target.id==="project-folder-input"&&state.modal){
     state.modal.path=event.target.value;
@@ -1002,15 +1212,25 @@ root.addEventListener("pointerdown",event=>{
 root.addEventListener("pointermove",event=>{
   if(!state.resizing)return;
   const {pane,startY,startHeight}=state.resizing;
-  const next=Math.max(pane==="shots"?58:80,Math.min(window.innerHeight*0.65,startHeight+event.clientY-startY));
+  const next=startHeight+event.clientY-startY;
   state.paneHeights[pane]=Math.round(next);
-  q(".app")?.style.setProperty(pane==="shots"?"--shots-height":"--files-height",next+"px");
+  constrainPanes(pane);
 });
-root.addEventListener("pointerup",()=>{
+function finishResize(){
   if(!state.resizing)return;
   state.resizing=null;
   chrome.storage.local.set({paneHeights:state.paneHeights}).catch(status);
-});
+}
+root.addEventListener('pointerup',finishResize);
+root.addEventListener('pointercancel',finishResize);
+root.addEventListener('lostpointercapture',finishResize);
+window.addEventListener?.('resize',()=>constrainPanes());
+root.addEventListener('scroll',event=>{
+  if(event.target===q('.recent-list')&&state.recentVisible<state.recent.downloads.length&&
+    event.target.scrollTop+event.target.clientHeight>=event.target.scrollHeight-80){
+    state.recentVisible+=100;render();
+  }
+},true);
 root.addEventListener("dragover",event=>{
   if(event.target.closest('[data-connect-folder]')){
     event.preventDefault();event.dataTransfer.dropEffect='copy';return;
@@ -1056,18 +1276,20 @@ root.addEventListener("drop",async event=>{
     if(internal&&shot){
       const source=JSON.parse(internal);
       if(source.project===destination.project&&source.sequence===destination.sequence&&source.shot===destination.shot)return;
-      await native("move_file",{
+      const result=await native("move_file",{
         sourceProject:source.project,sourceSequence:source.sequence,sourceShot:source.shot,
         category:source.category,name:source.name,...destination,
       });
-      await chooseShot(targetShot);
+      await revealFile(destination,result);
     }else if(event.dataTransfer.files.length){
       await importFiles(event.dataTransfer.files,destination);
-      if(shot&&targetShot!==state.shot)await chooseShot(targetShot);
     }
   }catch(error){status(error);}
 });
 root.addEventListener("keydown",event=>{
+  if(event.key==='Enter'&&event.target.id==='new-shot-name'&&!event.isComposing){
+    event.preventDefault();q('[data-action="create-shot"]')?.click();
+  }
   if(event.key==="Escape"&&state.openMenu){state.openMenu=null;render();}
 });
 chrome.runtime.onMessage.addListener(message=>{
@@ -1081,23 +1303,29 @@ async function activateTab(tab) {
   const [previous,tabContext,stored]=await Promise.all([
     tabId!==null?message("getDestination",{tabId}):null,
     tabId!==null?message("getContext",{tabId}):null,
-    chrome.storage.local.get(["lastContext","lastDestination","panelTheme","paneHeights","desktopDragMode","desktopDragModeRevision"]),
+    chrome.storage.local.get(["lastContext","lastDestination","panelTheme","paneHeights","desktopDragMode","desktopDragModeRevision","recentShots"]),
   ]);
   if(state.tabId!==tabId)return;
   const context=stored.lastContext||previous||tabContext||{};
+  const oldContext=currentDestination();
   state.project=context.project||"";
   state.sequence=context.sequence||"";
   const savedShot=stored.lastDestination;
   state.shot=savedShot?.project===state.project&&
     (savedShot.sequence||"")===(state.sequence||"") ? savedShot.shot : previous?.shot||"";
   state.theme=stored.panelTheme||"system";
+  state.recentShots=Array.isArray(stored.recentShots)?stored.recentShots.filter(item=>item?.project&&item?.shot).slice(0,12):[];
+  if(state.shot)state.recentShots=recordRecent(state.recentShots,currentDestination());
   state.desktopDragMode=stored.desktopDragModeRevision===1&&stored.desktopDragMode==='browser'?'browser':'native';
   if(stored.desktopDragModeRevision!==1)
     await chrome.storage.local.set({desktopDragMode:state.desktopDragMode,desktopDragModeRevision:1});
   if(state.desktopDragMode==='native')warmNativeDrag();
   if(stored.paneHeights)state.paneHeights={...state.paneHeights,...stored.paneHeights};
-  state.layout="";state.sequences=[];state.shots=[];state.files=[];
-  state.selected.clear();state.query="";state.openMenu=null;
+  if(oldContext?.project!==state.project||(oldContext?.sequence||'')!==(state.sequence||'')||oldContext?.shot!==state.shot){
+    state.layout="";state.sequences=[];state.shots=[];state.files=[];
+    state.selected.clear();state.query="";state.openMenu=null;
+  }
+  render();
   await refreshProjects();
 }
 chrome.tabs.onActivated.addListener(async info=>{
@@ -1112,12 +1340,21 @@ setInterval(()=>{
 (async()=>{
   render();
   try{
+    const snapshot=await message('getPanel').catch(()=>null);
+    if(snapshot?.version===chrome.runtime.getManifest().version){
+      for(const name of ['project','sequence','shot','projects','categories','layout','sequences','shots','files','platform','mediaExtensions','subversionsEnabled','nativeDragReady'])
+        if(snapshot[name]!==undefined)state[name]=snapshot[name];
+      for(const [id,data] of snapshot.thumbnails||[])cacheThumbnail(id,data);
+      state.connected=true;state.loading=false;state.fileManager=state.platform==='macos'?'Finder':'Explorer';render();
+    }
+    // Restore download metadata in parallel with the occasional update check.
+    const recentReady=refreshRecent();
     // Activate a newly installed extension without visiting chrome://extensions.
     const update=await message("checkUpdate").catch(()=>null);
     if(update?.reloading){root.innerHTML='<main class="panel"><div class="empty">Updating AIRenamer…</div></main>';return;}
     const tabs=await chrome.tabs.query({active:true,currentWindow:true});
     await activateTab(tabs[0]);
-    await refreshRecent();
+    await recentReady;
   }catch(error){state.loading=false;status(error);}
 })();
 })();

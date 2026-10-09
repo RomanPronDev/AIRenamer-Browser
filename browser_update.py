@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import utils
+import browser_platform
+from runtime_support import get_local_base_dir
 
 REPOSITORY = "RomanPronDev/AIRenamer-Browser"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -32,7 +34,7 @@ def version_tuple(value: str) -> tuple[int, int, int]:
 
 
 def installation_file() -> Path:
-    return Path(os.environ["LOCALAPPDATA"]) / "MediaRenamer" / "Browser" / "installation.json"
+    return Path(get_local_base_dir()) / "Browser" / "installation.json"
 
 
 def read_installation(path: Path | None = None) -> dict:
@@ -63,7 +65,7 @@ def _metadata(url: str = API_URL) -> dict:
     return data
 
 
-def select_release(metadata: dict, installed_version: str) -> tuple[str, dict] | None:
+def select_release(metadata: dict, installed_version: str, *, target_suffix: str | None = None) -> tuple[str, dict] | None:
     tag = metadata.get("tag_name", "")
     if not isinstance(tag, str) or not tag.startswith("v"):
         raise UpdateError("Invalid release tag")
@@ -72,7 +74,8 @@ def select_release(metadata: dict, installed_version: str) -> tuple[str, dict] |
         return None
     if metadata.get("draft") or metadata.get("prerelease"):
         return None
-    name = f"AIRenamer-Browser-{version}.zip"
+    suffix = browser_platform.package_suffix() if target_suffix is None else target_suffix
+    name = f"AIRenamer-Browser-{version}{suffix}.zip"
     assets = [asset for asset in metadata.get("assets", [])
               if isinstance(asset, dict) and asset.get("name") == name]
     if len(assets) != 1:
@@ -103,7 +106,8 @@ def download_asset(asset: dict, target: Path) -> None:
         raise UpdateError("Release archive failed size or SHA-256 verification")
 
 
-def extract_release(archive_path: Path, destination: Path, version: str) -> None:
+def extract_release(archive_path: Path, destination: Path, version: str, *, target_suffix: str | None = None) -> None:
+    suffix = browser_platform.package_suffix() if target_suffix is None else target_suffix
     with zipfile.ZipFile(archive_path) as archive:
         names = set()
         total_size = 0
@@ -113,7 +117,7 @@ def extract_release(archive_path: Path, destination: Path, version: str) -> None
             if (not parts or name.startswith("/") or "\\" in name or ":" in name
                     or any(part in (".", "..") for part in parts)
                     or (not item.is_dir() and item.file_size > MAX_ARCHIVE_BYTES)
-                    or (item.external_attr >> 16) & 0o170000 == 0o120000):
+                    or ((item.external_attr >> 16) & 0o170000 == 0o120000 and suffix != "-macos-arm64")):
                 raise UpdateError("Release archive contains an unsafe path")
             total_size += item.file_size
             if total_size > MAX_ARCHIVE_BYTES:
@@ -122,7 +126,14 @@ def extract_release(archive_path: Path, destination: Path, version: str) -> None
             if key in names:
                 raise UpdateError("Release archive contains duplicate paths")
             names.add(key)
-        archive.extractall(destination)
+        if suffix == "-macos-arm64":
+            import browser_mac_bundle
+            try:
+                browser_mac_bundle.extract_tree(archive, destination)
+            except (OSError, ValueError) as exc:
+                raise UpdateError("Invalid macOS archive: " + str(exc)) from exc
+        else:
+            archive.extractall(destination)
     try:
         package_version = json.loads((destination / "version.json").read_text(encoding="utf-8-sig"))["version"]
         extension_version = json.loads((destination / "browser" / "manifest.json").read_text(encoding="utf-8-sig"))["version"]
@@ -130,6 +141,20 @@ def extract_release(archive_path: Path, destination: Path, version: str) -> None
         raise UpdateError("Release archive is incomplete") from exc
     if package_version != version or extension_version != version:
         raise UpdateError("Release version does not match its archive")
+    if suffix == "-macos-arm64":
+        import browser_mac_install
+        try:
+            browser_mac_install.validate_package(destination)
+        except (OSError, ValueError, KeyError) as exc:
+            raise UpdateError("Invalid macOS release package: " + str(exc)) from exc
+        if not (destination / "Setup-Browser.command").is_file():
+            raise UpdateError("Release archive lacks macOS installer")
+        for relative in ("dist/MediaRenamerBrowserNative/MediaRenamerBrowserNative",
+                         "dist/MediaRenamerBrowserNative/BrowserDragBridge.app/Contents/MacOS/BrowserDragBridge"):
+            (destination / relative).chmod(0o755)
+        return
+    if suffix:
+        raise UpdateError("Unsupported release platform")
     if not (destination / "Install-BrowserNative.ps1").is_file() or not (
         destination / "dist" / "MediaRenamerBrowserNative.exe"
     ).is_file():
@@ -151,9 +176,17 @@ def check_and_install(installed_version: str, *, settings_path: Path | None = No
             package.mkdir()
             download_asset(asset, archive)
             extract_release(archive, package, version)
-            args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                    str(package / "Install-BrowserNative.ps1"), "-ExtensionFolder",
-                    settings["extensionFolder"]]
+            if browser_platform.is_macos():
+                extension_id = settings.get("extensionId", "")
+                if not re.fullmatch(r"[a-p]{32}", extension_id):
+                    raise UpdateError("Installed Chrome extension ID is missing; rerun macOS setup.")
+                args = [str(package / "dist/MediaRenamerBrowserNative/MediaRenamerBrowserNative"),
+                        "--install-browser", "--package-folder", str(package),
+                        "--extension-id", extension_id, "--no-open"]
+            else:
+                args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(package / "Install-BrowserNative.ps1"), "-ExtensionFolder",
+                        settings["extensionFolder"]]
             result = subprocess.run(args, capture_output=True, text=True, timeout=300,
                                     creationflags=0x08000000 if os.name == "nt" else 0,
                                     env=utils.sanitized_subprocess_environment())

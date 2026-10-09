@@ -801,6 +801,28 @@ def test_exclusive_file_lock_renews_live_lease(tmp_path):
     assert not lock_path.exists()
 
 
+def test_exclusive_file_lock_retries_transient_cleanup_sharing_conflict(monkeypatch, tmp_path):
+    lock_path = tmp_path / "sharing.lock"
+    real_remove = os.remove
+    failed_once = False
+
+    def sharing_conflict(path, *args, **kwargs):
+        nonlocal failed_once
+        if os.fspath(path) == str(lock_path) and not failed_once:
+            failed_once = True
+            raise PermissionError("File is temporarily open by another reader")
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "remove", sharing_conflict)
+    with config.exclusive_file_lock(str(lock_path), timeout=0.2):
+        assert lock_path.exists()
+
+    assert failed_once
+    assert not lock_path.exists()
+    with config.exclusive_file_lock(str(lock_path), timeout=0.2):
+        pass
+
+
 def test_stale_lock_recovery_never_deletes_a_live_successor(tmp_path):
     lock_path = tmp_path / "stale-race.lock"
     lock_path.write_text("abandoned", encoding="utf-8")

@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import config
+import browser_platform
 from runtime_support import default_settings, empty_machine_state
 
 _active_root = None
@@ -51,7 +52,7 @@ def initialize():
         setattr(config, name, str(path))
     # FFmpeg is a tool, not a preference. Reuse the cached binary across products.
     config.TOOLS_DIR = str(desktop / "Tools")
-    config.FFMPEG_PATH = str(desktop / "Tools/ffmpeg.exe")
+    config.FFMPEG_PATH = str(desktop / "Tools" / ("ffmpeg" if browser_platform.is_macos() else "ffmpeg.exe"))
     config.SERVER_ROOT_SOURCE = "isolated Browser AppData runtime"
     config.SERVER_ROOT_ERROR = ""
     machine = root / "State/Projects" / (config.get_machine_id() + ".json")

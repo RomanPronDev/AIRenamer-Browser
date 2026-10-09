@@ -1,0 +1,75 @@
+name: Browser macOS Apple Silicon
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'browser/**'
+      - 'browser_*.py'
+      - 'native_drag/**'
+      - '*Browser*.command'
+      - 'MediaRenamerBrowserNative.spec'
+      - 'runtime_support.py'
+      - 'config.py'
+      - 'utils.py'
+      - 'version.json'
+      - 'browser-requirements.txt'
+      - 'tests/test_browser*'
+      - 'tests/macos_protocol_smoke.py'
+      - '.github/workflows/browser-macos.yml'
+  pull_request:
+    paths:
+      - 'browser/**'
+      - 'browser_*.py'
+      - 'native_drag/**'
+      - '*Browser*.command'
+      - 'MediaRenamerBrowserNative.spec'
+      - 'runtime_support.py'
+      - 'config.py'
+      - 'utils.py'
+      - 'version.json'
+      - 'browser-requirements.txt'
+      - 'tests/test_browser*'
+      - 'tests/macos_protocol_smoke.py'
+      - '.github/workflows/browser-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.5'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check architecture and install build dependencies
+        run: |
+          test "$(uname -m)" = arm64
+          python -m pip install -r browser-requirements.txt
+      - name: Browser behavior and platform tests
+        run: |
+          python -m pytest tests/test_browser_macos.py tests/test_browser_native.py tests/test_browser_drag.py tests/test_browser_update.py -q
+          node --test browser/background.test.cjs browser/live.test.cjs browser/local-files.test.cjs browser/panel-model.test.cjs
+      - name: Build AppKit helper and frozen host
+        run: python browser_release.py
+      - name: Test the packaged native protocol, FFmpeg and installer
+        run: python tests/macos_protocol_smoke.py
+      - name: Upload test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIRenamer-Browser-macos-arm64-${{ matrix.os }}
+          path: dist/AIRenamer-Browser-*-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 14

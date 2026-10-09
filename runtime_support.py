@@ -3,10 +3,12 @@
 import datetime
 import json
 import ntpath
+import posixpath
 import os
 import re
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -277,6 +279,13 @@ def resolve_app_server_root(
 
 def get_local_base_dir(environ=None, *, required: bool = True) -> str:
     env = environ if environ is not None else os.environ
+    if sys.platform == "darwin":
+        user_home = env.get("HOME") or os.path.expanduser("~")
+        if not user_home or not posixpath.isabs(user_home):
+            if required:
+                raise RuntimePathError("An absolute macOS home directory is required.")
+            return ""
+        return posixpath.join(user_home, "Library", "Application Support", APP_LOCAL_DIR_NAME)
     local_app_data = env.get("LOCALAPPDATA", "")
     if not local_app_data:
         if required:
@@ -291,18 +300,21 @@ def get_local_base_dir(environ=None, *, required: bool = True) -> str:
 def get_local_runtime_paths(environ=None, *, required: bool = True) -> LocalRuntimePaths:
     """Return the complete standalone runtime layout below ``%LOCALAPPDATA%``."""
     root = get_local_base_dir(environ, required=required)
+    path_module = posixpath if sys.platform == "darwin" else ntpath
     return LocalRuntimePaths(
         root=root,
-        config=ntpath.join(root, "Config") if root else "",
-        state=ntpath.join(root, "State") if root else "",
-        tools=ntpath.join(root, "Tools") if root else "",
-        logs=ntpath.join(root, "Logs") if root else "",
-        diagnostics=ntpath.join(root, "Diagnostics") if root else "",
+        config=path_module.join(root, "Config") if root else "",
+        state=path_module.join(root, "State") if root else "",
+        tools=path_module.join(root, "Tools") if root else "",
+        logs=path_module.join(root, "Logs") if root else "",
+        diagnostics=path_module.join(root, "Diagnostics") if root else "",
     )
 
 
 def emergency_diagnostics_dir(environ=None) -> str:
     env = environ if environ is not None else os.environ
+    if sys.platform == "darwin":
+        return posixpath.join(get_local_base_dir(env), "Diagnostics")
     base = env.get("LOCALAPPDATA") or env.get("TEMP") or tempfile.gettempdir()
     return ntpath.normpath(ntpath.join(base, APP_LOCAL_DIR_NAME, "Diagnostics"))
 
@@ -312,7 +324,8 @@ def write_emergency_diagnostic(message: str, environ=None) -> str:
     try:
         os.makedirs(diagnostics_dir, exist_ok=True)
         today = datetime.datetime.now()
-        path = ntpath.join(diagnostics_dir, today.strftime("%Y-%m-%d.txt"))
+        path_module = posixpath if sys.platform == "darwin" else ntpath
+        path = path_module.join(diagnostics_dir, today.strftime("%Y-%m-%d.txt"))
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"{today.strftime('%H:%M:%S')} {message}\n")
         return path
@@ -599,10 +612,22 @@ def exclusive_file_lock(
                 timeout=1.0,
                 poll_interval=min(0.05, max(0.01, poll_interval)),
             ):
-                with open(lock_path, "r", encoding="utf-8") as handle:
-                    current = json.load(handle)
-                if current.get("token") == token:
-                    os.remove(lock_path)
+                cleanup_deadline = time.monotonic() + 1.0
+                while True:
+                    with open(lock_path, "r", encoding="utf-8") as handle:
+                        current = json.load(handle)
+                    if current.get("token") != token:
+                        break
+                    try:
+                        os.remove(lock_path)
+                        break
+                    except PermissionError:
+                        # On Windows a contender briefly reading ownership can
+                        # prevent deletion. Leaving our live-process token here
+                        # would otherwise block all subsequent acquisitions.
+                        if time.monotonic() >= cleanup_deadline:
+                            raise
+                        time.sleep(0.01)
         except (
             FileNotFoundError,
             OSError,

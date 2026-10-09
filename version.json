@@ -1,4 +1,4 @@
 {
-  "version": "0.27.9",
-  "release_notes": "Independent Browser naming settings with live preview, type suffixes, file types and categories; main versions and targeted subversions; includes automatic native drag and startup Loading."
+  "version": "0.30.0",
+  "release_notes": "Browser 0.30.0: resilient verified Windows FFmpeg provisioning with local/PATH reuse, API-independent checksum fallback, bounded retries, progress and retry controls on both platforms. Successfully assigned downloads remain highlighted yellow across panel/browser restarts. Includes 0.28 shot/folder creation and 0.29 panel retention, Recent shots, clicked thumbnails, copy-path controls, move focus and bounded pane resizing. Browser settings remain independent; FFmpeg is not bundled. Windows release; macOS source handoff requires Mac build and acceptance."
 }

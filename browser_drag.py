@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+import browser_platform
 
 
 class NativeDrag:
@@ -20,17 +21,16 @@ class NativeDrag:
         self.reader = None
 
     def start(self):
-        if os.name != "nt":
-            raise RuntimeError("Native drag is available only on Windows.")
+        if os.name != "nt" and not browser_platform.is_macos():
+            raise RuntimeError("Native drag requires Windows or macOS.")
         if self.process is not None and self.process.poll() is None:
             return
-        root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-        path = root / ("BrowserDragBridge.exe" if getattr(sys, "frozen", False)
-                       else "build_assets/BrowserDragBridge.exe")
+        path = browser_platform.bridge_executable()
         if not path.is_file():
             raise RuntimeError("Native drag helper is missing. Install the complete Browser package.")
         self.process = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=0x08000000)
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            creationflags=0x08000000 if os.name == "nt" else 0)
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
         self.reader.start()
 
@@ -71,7 +71,7 @@ class NativeDrag:
                 self.pending.pop(identifier, None)
                 raise
         try:
-            if not request["event"].wait(4):
+            if not request["event"].wait(300 if action == "choose_folder" else 4):
                 raise RuntimeError("Native drag helper did not respond. Release the mouse and retry.")
             answer = request["answer"]
             if not answer.get("ok"):

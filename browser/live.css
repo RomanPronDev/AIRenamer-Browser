@@ -34,6 +34,8 @@
 .shot-tools .search{flex:1;min-width:0;height:25px;margin:0;padding:0 6px;gap:4px}
 .shot-tools .search svg{width:12px;height:12px}
 .shot-tools .search input{padding:3px 0;font-size:10px}
+.shot-tools>.icon-button{height:25px;min-width:25px;flex:0 0 25px}
+.shot-tools>.icon-button svg{width:14px;height:14px}
 .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(64px,1fr));align-content:start;gap:3px;padding-top:5px}
 .shot{display:flex;justify-content:center;align-items:center;min-width:0;width:auto;height:26px;padding:3px 5px;border:1px solid #e0e8dc;border-radius:5px;background:#fff;text-align:center;font-size:10px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .shot:hover,.shot.drop-target{border-color:#83a27d;background:#eef5e9}
@@ -146,3 +148,40 @@ button.recent-thumb:hover{outline:1px solid #91aa8b}
 .shot-drag-handle{cursor:grab}.shot-drag-handle:active{cursor:grabbing}
 
 .settings-group{margin:12px 0;border-top:1px solid var(--line);padding-top:10px}.settings-group summary{cursor:pointer;font-size:12px;font-weight:600}.setting-pair{display:grid;grid-template-columns:1fr 1fr;gap:10px}.setting-pair input{min-width:0;width:100%}.category-setting{border:1px solid var(--line);padding:8px;border-radius:6px;margin:10px 0}.naming-preview{padding:8px;background:var(--paper);border:1px solid var(--line);border-radius:6px}.naming-preview small,.naming-preview code{display:block;overflow-wrap:anywhere}.naming-preview code{font-size:10px;margin:3px 0 7px}.naming-preview small{color:var(--muted)}.import-options{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:10px;padding:4px 0 7px;color:var(--muted)}.import-options label{display:flex;align-items:center;gap:3px}.import-options input{accent-color:var(--accent);margin:0}.field-error{color:#c76c52}
+
+/* 0.29: keep all three sections within the panel's viewport. */
+html,body,#root{height:100%;overflow:hidden}
+.app{height:100dvh;max-height:100dvh;min-height:0;overflow:hidden}
+.app-header{height:39px;flex:0 0 39px}
+.navigation{flex:0 1 auto;min-height:0;max-height:none;overflow:visible}
+.shots{height:var(--shots-height);min-height:0;max-height:none;flex:0 1 auto}
+.files{height:var(--files-height);min-height:0;max-height:none;flex:0 1 auto}
+.file-list{flex:1 1 auto}
+.recent,.recent.fill{flex:1 1 66px;min-height:min(66px,20vh);max-height:none;overflow:hidden}
+.recent-heading{flex:0 0 auto}
+.recent-list{flex:1 1 auto}
+.app>.error,.app>.connection{flex:0 0 auto;max-height:60px;overflow:auto}
+.recent-shots{display:flex;align-items:center;gap:6px;height:27px;min-width:0}
+.recent-shots>span{font-size:9px;color:var(--muted);flex:0 0 auto}
+.recent-shots>div{display:flex;align-items:center;gap:3px;min-width:0;overflow-x:auto;scrollbar-width:thin;white-space:nowrap}
+.recent-shot{border:1px solid var(--line);border-radius:4px;padding:3px 6px;font-size:10px;color:var(--green);flex:0 0 auto}
+.recent-shot.active{background:#e3f0dc}
+.file-row{border-radius:5px;margin:2px 0;padding-left:3px}
+.file-row.media-video{background:#edf3fa}
+.file-row.media-image{background:#faf0e9}
+.file-thumb{padding:0;width:27px;height:27px;flex:0 0 27px;overflow:hidden}
+.file-thumb img,.file-thumb video{width:100%;height:100%;object-fit:cover}
+.file-thumb:hover{outline:1px solid var(--green)}
+.file-thumb.loading svg{animation:preview-pulse .8s ease-in-out infinite alternate}
+.file-row.focused{outline:2px solid #879d64;outline-offset:-2px}
+.more-downloads{display:block;margin:5px auto}
+:root[data-theme="dark"] .file-row.media-video{background:#202d3a}
+:root[data-theme="dark"] .file-row.media-image{background:#352b25}
+:root[data-theme="dark"] .recent-shot.active{background:#3d563e}
+@media(prefers-reduced-motion:no-preference){.file-row.focused{animation:focus-file .6s ease-out}}
+@keyframes focus-file{from{box-shadow:inset 0 0 0 3px #9ab994}to{box-shadow:inset 0 0 0 0 transparent}}
+
+.recent-row.assigned-download{background:#fff1b8;border-radius:5px;padding-left:4px;padding-right:4px;border-color:#e7ce70}
+.assigned-download .recent-state{background:#c69d21}
+:root[data-theme="dark"] .recent-row.assigned-download{background:#403719;border-color:#75652c}
+:root[data-theme="dark"] .assigned-download .recent-name-button,:root[data-theme="dark"] .assigned-download .recent-name{color:#fff0b3}

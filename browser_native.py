@@ -32,6 +32,7 @@ import utils
 import browser_update
 import browser_drag
 import browser_settings
+import browser_platform
 
 MAX_INBOUND = 64 * 1024 * 1024
 MAX_OUTBOUND = 1024 * 1024
@@ -76,6 +77,12 @@ def _component(value: object, name: str) -> str:
 
 def _choose_project_folder(initial: str = "") -> str:
     """Show the native Windows folder picker without bundling Tk or Qt."""
+    if browser_platform.is_macos():
+        bridge = browser_drag.NativeDrag()
+        try:
+            return bridge.request("choose_folder", initial).get("path", "")
+        finally:
+            bridge.close()
     if os.name != "nt":
         raise HostError("Folder selection is available only on Windows")
     script = r"""
@@ -133,6 +140,8 @@ try {
 
 def _launch_native_drag(path: str) -> None:
     """Show a small Windows drag source that offers the real file as FileDrop."""
+    if browser_platform.is_macos():
+        raise HostError("Use the macOS drag helper through the Browser host")
     if os.name != "nt":
         raise HostError("Desktop drag is available only on Windows")
     script = r"""
@@ -298,9 +307,11 @@ def _target_root(project_name: str, shot_path: str) -> str:
     return config.join_prefixed(shot_path, _project_structure(project_name)["targetPrefix"])
 
 
-def _ensure_media_folders(project_name: str, shot_path: str) -> str:
+def _ensure_media_folders(project_name: str, shot_path: str, *, standard_only: bool = False) -> str:
     target = _target_root(project_name, shot_path)
     for category in _categories(project_name):
+        if standard_only and category.id not in {"keyframes", "video"}:
+            continue
         os.makedirs(os.path.join(target, category.folder), exist_ok=True)
     return target
 
@@ -388,6 +399,34 @@ def _shot(project: str, sequence: str | None, shot: str) -> tuple[str, str]:
     if shot not in _children(root):
         raise HostError("Unknown shot")
     return os.path.join(root, shot), mode
+
+
+def _check_creation_path(project_path: str, path: str) -> None:
+    """Do not create folders inside excluded branches of a project."""
+    project_path = os.path.abspath(project_path)
+    path = os.path.abspath(path)
+    if os.path.commonpath([project_path, path]) != project_path:
+        raise HostError("Folder must be inside the project")
+    while path != project_path:
+        if config.is_ignored(path, os.path.basename(path)):
+            raise HostError(f"Folder is ignored: {path}")
+        path = os.path.dirname(path)
+
+
+def _creation_root(project: str, sequence: str | None) -> str:
+    project_path, mode, root = _navigation(project, sequence)
+    if not os.path.isdir(project_path):
+        raise HostError("Project folder unavailable")
+    if mode == config.PROJECT_LAYOUT_SEQUENCES and not sequence:
+        raise HostError("Select a sequence before creating a shot")
+    _check_creation_path(project_path, root)
+    return root
+
+
+def _standard_media_paths(project: str, shot_path: str) -> list[str]:
+    structure = _project_structure(project)
+    target = config.join_prefixed(shot_path, structure["targetPrefix"])
+    return [os.path.join(target, structure[key]) for key in ("imageFolder", "videoFolder")]
 
 
 def _category(category_id: str, project: str | None = None):
@@ -625,6 +664,7 @@ class BrowserHost:
             return modes.get(name) if modes.get(name) in config.PROJECT_LAYOUTS else (
                 config.PROJECT_LAYOUT_SHOTS if config.SKIP_SEQUENCE else config.PROJECT_LAYOUT_SEQUENCES)
         return {
+            **browser_platform.capabilities(),
             "projects": [
                 {"name": name, "path": path,
                  "layout": layout_for(name, path),
@@ -905,6 +945,55 @@ class BrowserHost:
         config.update_json_file(_structure_file(), {}, forget)
         return {"removed": name}
 
+    def shot_creation_info(self, payload):
+        project = payload["project"]
+        root = _creation_root(project, payload.get("sequence") or None)
+        structure = _project_structure(project)
+        return {"shotsRoot": root, "mediaPrefix": structure["targetPrefix"],
+                "mediaFolders": [structure["imageFolder"], structure["videoFolder"]]}
+
+    def create_shot(self, payload):
+        project = payload["project"]
+        sequence = payload.get("sequence") or None
+        name = _component(payload.get("shot"), "shot name")
+        root = _creation_root(project, sequence)
+        shot_path = os.path.join(root, name)
+        paths = _standard_media_paths(project, shot_path)
+        project_path = config.get_projects()[project]
+        for path in paths:
+            _check_creation_path(project_path, path)
+        try:
+            os.makedirs(root, exist_ok=True)
+            # Check case-insensitively on every platform; mkdir still arbitrates races.
+            with os.scandir(root) as entries:
+                if any(entry.name.casefold() == name.casefold() for entry in entries):
+                    raise HostError("A shot or file with this name already exists")
+            os.mkdir(shot_path)
+        except FileExistsError as exc:
+            raise HostError("A shot or file with this name already exists") from exc
+        except OSError as exc:
+            raise HostError(f"Could not create shot: {exc}") from exc
+        try:
+            _ensure_media_folders(project, shot_path, standard_only=True)
+        except OSError as exc:
+            # Never delete a created shot: another process may already have used it.
+            raise HostError(f"Shot {name} was created, but media folders could not be created. "
+                            f"Select the shot and retry Create media folders: {exc}") from exc
+        return {"project": project, "sequence": sequence, "shot": name,
+                "path": shot_path, "folders": paths}
+
+    def create_media_folders(self, payload):
+        project = payload["project"]
+        shot_path, _ = _shot(project, payload.get("sequence"), payload["shot"])
+        paths = _standard_media_paths(project, shot_path)
+        for path in paths:
+            _check_creation_path(config.get_projects()[project], path)
+        try:
+            _ensure_media_folders(project, shot_path, standard_only=True)
+        except OSError as exc:
+            raise HostError(f"Could not create media folders: {exc}") from exc
+        return {"folders": paths}
+
     def navigation(self, payload):
         name = payload["project"]
         path, mode = _project(name)
@@ -1073,9 +1162,8 @@ class BrowserHost:
             if job["cancel"].is_set():
                 job["state"] = "cancelled"
                 return
-            local_path = utils.resolve_ffmpeg(
-                target_path=config.FFMPEG_PATH, allow_frozen_download=True, timeout=600,
-            )
+            import browser_ffmpeg
+            local_path = browser_ffmpeg.provision(config.FFMPEG_PATH, timeout=600)
             if job["cancel"].is_set():
                 job["state"] = "cancelled"
                 return
@@ -1109,7 +1197,7 @@ class BrowserHost:
             path, _ = _project(payload["project"])
             if not os.path.isdir(path):
                 raise HostError("Project folder unavailable")
-            os.startfile(path)
+            browser_platform.open_folder(path)
             return {"opened": True}
         if payload.get("file"):
             path, category = _file(payload["project"], payload.get("sequence"),
@@ -1120,22 +1208,24 @@ class BrowserHost:
                 directory = utils.find_converted_sequence_folder(path)
                 if not directory or not os.path.isdir(directory):
                     raise HostError("PNG sequence folder unavailable")
-                subprocess.Popen(["explorer.exe", "/select,", directory])
+                browser_platform.open_folder(directory, reveal=True)
                 return {"opened": True}
             if not os.path.isdir(os.path.dirname(path)):
                 raise HostError("Folder unavailable")
-            subprocess.Popen(["explorer.exe", "/select,", path])
+            browser_platform.open_folder(path, reveal=True)
             return {"opened": True}
         shot_path, _ = _shot(payload["project"], payload.get("sequence"), payload["shot"])
         directory = _target_root(payload["project"], shot_path)
         if not os.path.isdir(directory):
             raise HostError("Folder unavailable")
-        os.startfile(directory)
+        browser_platform.open_folder(directory)
         return {"opened": True}
 
     def drag_to_app(self, payload):
         path, _ = _file(payload["project"], payload.get("sequence"),
                         payload["shot"], payload["category"], payload["name"])
+        if browser_platform.is_macos():
+            return self._native_drag.request("handle", path)
         _launch_native_drag(path)
         return {"opened": True}
 
@@ -1280,7 +1370,7 @@ class BrowserHost:
         if not isinstance(payload, dict):
             raise HostError("Payload must be an object")
         commands = {
-            "ping": lambda _: {"version": config.get_app_version()},
+            "ping": lambda _: {"version": config.get_app_version(), **browser_platform.capabilities()},
             "start_update": self.start_update,
             "projects": self.projects,
             "preferences": self.preferences,
@@ -1297,6 +1387,9 @@ class BrowserHost:
             "change_project_path": self.change_project_path,
             "remove_project": self.remove_project,
             "navigation": self.navigation,
+            "shot_creation_info": self.shot_creation_info,
+            "create_shot": self.create_shot,
+            "create_media_folders": self.create_media_folders,
             "files": self.files,
             "import_file": self.import_file,
             "rename_file": self.rename_file,
@@ -1311,6 +1404,8 @@ class BrowserHost:
             "drag_stop": self.drag_stop,
             "drag_probe": self.drag_probe,
             "drag_direct": self.drag_direct,
+            "ffmpeg_status": self.ffmpeg_status,
+            "ffmpeg_setup": self.ffmpeg_setup,
             "preview": self.preview,
             "preview_download": self.preview_download,
             "transfer_begin": self.transfer_begin,
@@ -1322,6 +1417,32 @@ class BrowserHost:
             raise HostError("Unknown command")
         return commands[kind](payload)
 
+    def ffmpeg_status(self, _payload):
+        import browser_ffmpeg
+        return browser_ffmpeg.tool_status(Path(config.FFMPEG_PATH))
+
+    def ffmpeg_setup(self, _payload):
+        command = ([sys.executable] if getattr(sys, "frozen", False)
+                   else [sys.executable, os.path.abspath(__file__)])
+        import browser_ffmpeg
+        target = Path(config.FFMPEG_PATH)
+        state = browser_ffmpeg.tool_status(target)
+        if state.get('state') == 'ready':
+            return {'started': False, **state}
+        if state.get("state") in browser_ffmpeg.ACTIVE_STATES:
+            return {"started": True}
+        platform = 'macos' if browser_platform.is_macos() else 'windows'
+        browser_ffmpeg._report(target, "queued", platform=platform)
+        try:
+            subprocess.Popen([*command, "--install-ffmpeg"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000 if os.name == 'nt' else 0,
+                             env=browser_platform.detached_host_environment(), close_fds=True)
+        except OSError as exc:
+            browser_ffmpeg._report(target, "error", error=str(exc), platform=platform)
+            raise
+        return {"started": True}
+
     def start_update(self, _payload):
         browser_update.read_installation()
         command = ([sys.executable] if getattr(sys, "frozen", False)
@@ -1330,7 +1451,7 @@ class BrowserHost:
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          creationflags=0x08000000 if os.name == "nt" else 0,
-                         env=utils.sanitized_subprocess_environment(),
+                         env=browser_platform.detached_host_environment(),
                          close_fds=True)
         return {"started": True}
 
@@ -1386,13 +1507,20 @@ def run(reader=None, writer=None):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--install-browser"]:
+        import browser_mac_install
+        try:
+            raise SystemExit(browser_mac_install.main(sys.argv[2:]))
+        except (OSError, ValueError, RuntimeError) as exc:
+            print("Browser setup failed: " + str(exc), file=sys.stderr)
+            raise SystemExit(1)
     if sys.argv[1:] == ["--auto-update"]:
         raise SystemExit(browser_update.run_auto_update(config.get_app_version()))
     if sys.argv[1:] == ["--install-ffmpeg"]:
         try:
             browser_settings.initialize()
-            utils.resolve_ffmpeg(target_path=config.FFMPEG_PATH,
-                                 allow_frozen_download=True, timeout=600)
+            import browser_ffmpeg
+            browser_ffmpeg.provision(config.FFMPEG_PATH, timeout=600)
             raise SystemExit(0)
         except Exception as exc:
             log = browser_update.installation_file().parent / "ffmpeg-setup.log"

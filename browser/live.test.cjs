@@ -2,9 +2,11 @@ const test=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
+const liveSource=()=>fs.readFileSync(__dirname+'/panel-model.js','utf8')+'\n'+fs.readFileSync(__dirname+'/live.js','utf8');
 
 async function dragPanel(mode,localFiles,options={}){
   const listeners={},calls=[],saved=[];
+  const shots=options.shots||['SH010'],layout=options.layout||'shots',sequences=options.sequences||[];
   const file={category:'keyframes',name:'frame.png',path:'D:\\Project\\vfx\\shots\\SH010\\genai\\frame.png',
     dragUrl:'http://127.0.0.1:1234/file/temporary',nativeDragToken:'validated-token',size:10,modified:123,version:null};
   const root={innerHTML:'',addEventListener(name,fn){listeners[name]=fn;},querySelector(selector){return options.fields?.[selector]||null;},querySelectorAll(selector){return selector==='[data-category-field]'?(options.categoryFields||[]):[];}};
@@ -12,11 +14,24 @@ async function dragPanel(mode,localFiles,options={}){
     async sendMessage(message){
       calls.push(message);
       if(message.kind==='checkUpdate')return {ok:true,result:{}};
-      if(message.kind==='recent')return {ok:true,result:{downloads:options.downloads||[],managed:[]}};
+      if(message.kind==='getPanel')return {ok:true,result:options.snapshot||null};
+      if(message.kind==='savePanel')return {ok:true,result:{saved:true}};
+      if(message.kind==='recent')return {ok:true,result:{downloads:options.downloads||[],managed:options.managed||[]}};
       if(message.type==='projects'){if(options.projectGate)await options.projectGate;if(options.projectError)throw Error(options.projectError);}
-      if(message.type==='projects')return {ok:true,result:{projects:[{name:'Project',path:'D:\\Project',layout:'shots'}],categories:options.categories||[{id:'keyframes',folder:'img'}],preferences:options.preferences}};
-      if(message.type==='navigation')return {ok:true,result:{layout:'shots',shots:['SH010'],sequences:[]}};
-      if(message.type==='files')return {ok:true,result:{files:[file]}};
+      if(message.type==='projects')return {ok:true,result:{projects:[{name:'Project',path:'D:\\Project',layout}],categories:options.categories||[{id:'keyframes',folder:'img'}],preferences:options.preferences,...options.platform}};
+      if(message.type==='navigation')return {ok:true,result:{layout,shots:layout==='sequences'&&!message.payload.sequence?[]:shots,sequences}};
+      if(message.type==='shot_creation_info')return {ok:true,result:{shotsRoot:'D:\\Project\\vfx\\shots',mediaPrefix:'custom-ai',mediaFolders:['STILLS','CLIPS']}};
+      if(message.type==='create_shot'){
+        if(options.createShotError)throw Error(options.createShotError);
+        shots.push(message.payload.shot);return {ok:true,result:{...message.payload}};
+      }
+      if(message.type==='create_media_folders'){
+        if(options.createFoldersError)throw Error(options.createFoldersError);
+        return {ok:true,result:{folders:['D:\\Project\\STILLS','D:\\Project\\CLIPS']}};
+      }
+      if(message.type==='files')return {ok:true,result:{files:options.files?.(message.payload)||[file]}};
+      if(message.type==='preview')return {ok:true,result:{available:true,mediaType:'image',mime:'image/jpeg',data:'AAAA'}};
+      if(message.type==='move_file')return {ok:true,result:options.moveResult||{name:'moved.png',path:'D:\\Project\\moved.png'}};
       if(message.type==='drag_prepare')return {ok:true,result:{ready:true}};
       if(message.type==='drag_direct')return {ok:true,result:options.dragResult||{started:true}};
       if(message.type==='preferences')return {ok:true,result:{settings:options.settings,ignoredNames:[],preview:options.preview}};
@@ -26,18 +41,176 @@ async function dragPanel(mode,localFiles,options={}){
       if(message.type==='transfer_begin')return {ok:true,result:{transferId:'transfer-1'}};
       if(['transfer_chunk','transfer_finish','transfer_abort'].includes(message.type))return {ok:true,result:{}};
       if(message.type==='drag_status')return {ok:true,result:options.dropResult};
+      if(message.type==='ffmpeg_status')return {ok:true,result:options.ffmpegStatus||{state:'ready'}};
+      if(message.type==='ffmpeg_setup')return {ok:true,result:{started:true}};
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
-    storage:{local:{get:async()=>({lastContext:{project:'Project'},lastDestination:{project:'Project',shot:'SH010'},desktopDragMode:mode,desktopDragModeRevision:Object.hasOwn(options,'revision')?options.revision:1}),set:async value=>saved.push(value)}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+    storage:{local:{get:async()=>({lastContext:{project:'Project',sequence:options.sequence},lastDestination:{project:'Project',sequence:options.sequence,shot:'SH010'},recentShots:options.recentShots,desktopDragMode:mode,desktopDragModeRevision:Object.hasOwn(options,'revision')?options.revision:1}),set:async value=>saved.push(value)}}};
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
-    window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,Date,btoa,
+    window:{matchMedia:()=>({matches:false}),innerHeight:options.height||800},chrome,URL,Set,Map,Promise,Date,btoa,
+    navigator:{clipboard:{writeText:async text=>saved.push({clipboard:text})}},
     ...(localFiles?{AIRenamerLocalFiles:class{connected(){return true;}get(){return localFiles;}}}:{}),
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
   });
   await new Promise(resolve=>setTimeout(resolve,0));
   return {listeners,calls,file,root,saved};
 }
+const clickAction=(panel,action)=>panel.listeners.click({target:{dataset:{action},closest(){return this;}}});
+const fileAction=(panel,action)=>panel.listeners.click({target:{dataset:{action,category:'keyframes',name:'frame.png'},closest(){return this;}}});
+test('assigned downloads are yellow and a reused ID with a different timestamp is not marked',async()=>{
+  const source='C:/Downloads/a.png';
+  const panel=await dragPanel('native',null,{downloads:[{id:1,state:'complete',filename:source,startTime:'current'}],
+    managed:[{id:1,source,startTime:'current',project:'Project',sequence:'30',shot:'SH010'}]});
+  assert.match(panel.root.innerHTML,/recent-row assigned-download/);assert.match(panel.root.innerHTML,/Saved to Project \/ 30 \/ SH010/);
+  const other=await dragPanel('native',null,{downloads:[{id:1,state:'complete',filename:source,startTime:'new'}],
+    managed:[{id:1,source,startTime:'old'}]});
+  assert.doesNotMatch(other.root.innerHTML,/recent-row assigned-download/);
+});
+test('Windows Settings exposes FFmpeg status and retry without replacing naming drafts',async()=>{
+  const label={textContent:''},retry={disabled:false},draft={value:'unsaved'};
+  const panel=await dragPanel('native',null,{ffmpegStatus:{state:'error',error:'Proxy refused'},
+    fields:{'#ffmpeg-status':label,'[data-action="setup-ffmpeg"]':retry,'#setting-filename_template':draft}});
+  await clickAction(panel,'settings');await new Promise(resolve=>setTimeout(resolve,0));
+  assert.match(panel.root.innerHTML,/Prepare \/ retry video tools/);assert.match(label.textContent,/Proxy refused/);
+  assert.equal(retry.disabled,false);assert.equal(draft.value,'unsaved');
+});
+test('shot thumbnail loads only after one click and is reused in full preview',async()=>{
+  const panel=await dragPanel('native');
+  assert.equal(panel.calls.filter(call=>call.type==='preview').length,0);
+  assert.match(panel.root.innerHTML,/data-action="load-file-thumbnail"/);
+  await fileAction(panel,'load-file-thumbnail');await fileAction(panel,'load-file-thumbnail');
+  await fileAction(panel,'preview');
+  assert.equal(panel.calls.filter(call=>call.type==='preview').length,1);
+});
+test('copy file path is available inline and copies the real path immediately',async()=>{
+  const panel=await dragPanel('native');
+  assert.match(panel.root.innerHTML,/copy-shortcut[^>]*data-action="copy-path"/);
+  await fileAction(panel,'copy-path');
+  assert.equal(panel.saved.find(item=>item.clipboard).clipboard,panel.file.path);
+});
+test('recent shots retain sequence context and quickly switch to that sequence',async()=>{
+  const panel=await dragPanel('native',null,{layout:'sequences',sequences:['30','45'],sequence:'30',
+    recentShots:[{project:'Project',sequence:'45',shot:'SH010'}]});
+  assert.match(panel.root.innerHTML,/Recently used shots/);
+  // Current shot is placed first; the previously used sequence remains second.
+  await panel.listeners.click({target:{dataset:{action:'recent-shot',index:'1'},closest(){return this;}}});
+  assert.equal(panel.calls.filter(call=>call.type==='files').at(-1).payload.sequence,'45');
+  assert.equal(panel.saved.filter(item=>item.recentShots).at(-1).recentShots[0].sequence,'45');
+});
+test('internal move selects its destination, centers and focuses the moved file',async()=>{
+  const focused=[],path='D:\\Project\\moved.png',row={dataset:{category:'keyframes',name:'moved.png'},
+    scrollIntoView:options=>focused.push(options.block),focus:()=>focused.push('focus')};
+  const panel=await dragPanel('native',null,{shots:['SH010','SH020'],moveResult:{name:'moved.png',path},
+    files:dest=>dest.shot==='SH020'?[{category:'keyframes',name:'moved.png',path,version:1}]:undefined});
+  const originalQuery=panel.root.querySelectorAll;
+  panel.root.querySelectorAll=selector=>selector==='.file-row'?[row]:originalQuery(selector);
+  await panel.listeners.drop({preventDefault(){},target:{closest:selector=>selector==='.shot'?{dataset:{shot:'SH020'},classList:{remove(){}}}:null},
+    dataTransfer:{getData:()=>JSON.stringify({project:'Project',sequence:null,shot:'SH010',category:'keyframes',name:'frame.png'}),files:[]}});
+  assert.equal(panel.calls.filter(call=>call.type==='files').at(-1).payload.shot,'SH020');
+  assert.deepEqual(focused,['center','focus']);assert.match(panel.root.innerHTML,/file-row media-image focused/);
+});
+test('all downloads remain accessible while initial rendering is bounded',async()=>{
+  const downloads=Array.from({length:250},(_,id)=>({id,filename:'C:/Downloads/report'+id+'.pdf',state:'complete'}));
+  const panel=await dragPanel('native',null,{downloads});
+  assert.equal((panel.root.innerHTML.match(/class="recent-row"/g)||[]).length,100);
+  assert.match(panel.root.innerHTML,/RECENT DOWNLOADS <span>250/);
+  await clickAction(panel,'more-downloads');await clickAction(panel,'more-downloads');
+  assert.equal((panel.root.innerHTML.match(/class="recent-row"/g)||[]).length,250);
+});
+test('cached files are displayed during reopening before a slow fresh project read completes',async()=>{
+  let release;
+  const projectGate=new Promise(resolve=>release=resolve);
+  const snapshot={version:'0.27.8',project:'Project',sequence:'',shot:'SH010',projects:[{name:'Project'}],
+    categories:[{id:'keyframes',folder:'KEYFRAMES',mediaType:'image'}],layout:'shots',sequences:[],shots:['SH010'],
+    files:[{category:'keyframes',name:'cached-file.png',path:'D:/cached-file.png',version:1}],thumbnails:[]};
+  const panel=await dragPanel('native',null,{projectGate,snapshot});
+  assert.match(panel.root.innerHTML,/cached-file.png/);
+  assert.doesNotMatch(panel.root.innerHTML,/connection loading/);
+  release();await new Promise(resolve=>setTimeout(resolve,0));
+  assert.match(panel.root.innerHTML,/frame.png/);assert.doesNotMatch(panel.root.innerHTML,/cached-file.png/);
+});
+test('resizing cannot put Files and Downloads below a short viewport and cancellation saves the bounds',async()=>{
+  const css={},fields={'.app':{style:{setProperty:(key,value)=>css[key]=parseFloat(value)}},
+    '.shots':{getBoundingClientRect:()=>({height:126})}};
+  const panel=await dragPanel('native',null,{height:480,fields});
+  const handle={dataset:{resize:'shots'},setPointerCapture(){}};
+  panel.listeners.pointerdown({target:{closest:()=>handle},preventDefault(){},clientY:0,pointerId:1});
+  panel.listeners.pointermove({clientY:99999});
+  assert(css['--shots-height']+css['--files-height']<=480-150-66);
+  panel.listeners.pointercancel();
+  assert(panel.saved.some(item=>item.paneHeights));
+});
+test('new shot uses selected sequence, shows configured folders and selects the created shot',async()=>{
+  const input={value:'ham0020',focus(){}};
+  const panel=await dragPanel('native',null,{layout:'sequences',sequences:['45','46'],sequence:'45',fields:{'#new-shot-name':input}});
+  assert.match(panel.root.innerHTML,/data-action="new-shot"/);
+  await clickAction(panel,'new-shot');
+  assert.match(panel.root.innerHTML,/New shot/);assert.match(panel.root.innerHTML,/STILLS and CLIPS inside custom-ai/);
+  await clickAction(panel,'create-shot');
+  const request=panel.calls.find(item=>item.type==='create_shot');
+  assert.equal(request.payload.project,'Project');assert.equal(request.payload.sequence,'45');assert.equal(request.payload.shot,'ham0020');
+  assert.match(panel.root.innerHTML,/data-shot="ham0020" aria-pressed="true"/);
+  assert(panel.calls.some(item=>item.type==='files'&&item.payload.shot==='ham0020'));
+  assert.doesNotMatch(panel.root.innerHTML,/aria-label="New shot"/);
+});
+test('new shot errors remain in the dialog with the entered name',async()=>{
+  const panel=await dragPanel('native',null,{createShotError:'A shot or file with this name already exists',fields:{'#new-shot-name':{value:'SH010',focus(){}}}});
+  await clickAction(panel,'new-shot');await clickAction(panel,'create-shot');
+  assert.match(panel.root.innerHTML,/dialog-error.*already exists/);
+  assert.match(panel.root.innerHTML,/id="new-shot-name"[^>]*value="SH010"/);
+  assert.doesNotMatch(panel.root.innerHTML,/data-action="create-shot" disabled/);
+});
+test('new shot is disabled until a sequence is chosen',async()=>{
+  const panel=await dragPanel('native',null,{layout:'sequences',sequences:['45','46']});
+  assert.match(panel.root.innerHTML,/data-action="new-shot"[^>]*disabled/);
+});
+test('Enter submits a shot name while IME composition does not',async()=>{
+  let submits=0,prevented=0;
+  const panel=await dragPanel('native',null,{fields:{'[data-action="create-shot"]':{click(){submits++;}}}});
+  const event={key:'Enter',target:{id:'new-shot-name'},preventDefault(){prevented++;}};
+  panel.listeners.keydown({...event,isComposing:true});
+  assert.equal(submits,0);
+  panel.listeners.keydown(event);
+  assert.equal(submits,1);assert.equal(prevented,1);
+});
+test('create media folders targets the selected shot and confirms configured names',async()=>{
+  const panel=await dragPanel('native');
+  await clickAction(panel,'create-media-folders');
+  const request=panel.calls.find(item=>item.type==='create_media_folders');
+  assert.equal(request.payload.project,'Project');assert.equal(request.payload.shot,'SH010');assert.equal(request.payload.sequence,null);
+  assert.match(panel.root.innerHTML,/Media folders ready: STILLS · CLIPS/);
+});
+test('media folder failure is visible and the action can be retried',async()=>{
+  const panel=await dragPanel('native',null,{createFoldersError:'Could not create media folders: access denied'});
+  await clickAction(panel,'create-media-folders');
+  assert.match(panel.root.innerHTML,/role="alert".*access denied/);
+  assert.doesNotMatch(panel.root.innerHTML,/data-action="create-media-folders"[^>]*disabled/);
+  assert.doesNotMatch(panel.root.innerHTML,/Media folders ready/);
+});
+test('macOS uses Finder and a mounted-volume path hint',async()=>{
+  const panel=await dragPanel('native',null,{platform:{platform:'macos',projectPathExample:'/Volumes/Projects/MyProject'}});
+  assert.match(panel.root.innerHTML,/Show in Finder/);
+  assert.doesNotMatch(panel.root.innerHTML,/Show in Explorer/);
+  await panel.listeners.click({target:{dataset:{action:'new-project-path'},closest(){return this;}}});
+  assert.match(panel.root.innerHTML,/placeholder="\/Volumes\/Projects\/MyProject"/);
+  assert.match(panel.root.innerHTML,/path from Finder/);
+});
+
+test('macOS video-tool status updates without replacing edited settings fields',async()=>{
+  const label={textContent:''}, retry={disabled:false};
+  const draft={value:'my_unsaved_template'};
+  const panel=await dragPanel('native',null,{platform:{platform:'macos'},
+    ffmpegStatus:{state:'downloading',bytes:2097152,total:4194304},
+    fields:{'#ffmpeg-status':label,'[data-action="setup-ffmpeg"]':retry,'#setting-filename_template':draft}});
+  await panel.listeners.click({target:{dataset:{action:'settings'},closest(){return this;}}});
+  await new Promise(resolve=>setTimeout(resolve,0));
+  assert.equal(label.textContent,'Downloading video tools… 2 MB / 4 MB');
+  assert.equal(draft.value,'my_unsaved_template');
+  assert.equal(retry.disabled,true);
+  await panel.listeners.click({target:{dataset:{action:'close'},closest(){return this;}}});
+});
+
 test('native mode warms automatically and cancels the Chrome drag before handing off the same gesture',async()=>{
   const panel=await dragPanel('native');
   assert.equal(panel.calls.filter(item=>item.type==='drag_prepare').length,1);
@@ -133,7 +306,7 @@ test('Recent Downloads requests a preview only after one file is clicked',async(
     tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}},
   };
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -161,7 +334,7 @@ test('project picker appears only when no folders are configured',async()=>{
         throw Error(JSON.stringify(message));
       }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
       storage:{local:{get:async()=>({}),set:async()=>{}}}};
-    vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+    vm.runInNewContext(liveSource(),{
       document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
       window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
       setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -196,7 +369,7 @@ test('a project can be added by path with no desktop configuration',async()=>{
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -234,7 +407,7 @@ test('Browse fills the first project path before it is saved',async()=>{
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -273,7 +446,7 @@ test('adding a project still completes if its dialog closes while the companion 
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -304,7 +477,7 @@ test('project registration failure is visible inside the still-open dialog',asyn
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -345,7 +518,7 @@ test('Settings can preview and save a project shots tree for multiple sequences'
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -389,7 +562,7 @@ test('Settings suggests the real project root when shots was added as a project'
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({lastContext:{project:'shots'}}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,
@@ -428,7 +601,7 @@ test('desktop drag action sends the selected file to the local companion',async(
       throw Error(JSON.stringify(message));
     }},tabs:{query:async()=>[],onActivated:{addListener(){}}},
     storage:{local:{get:async()=>({lastContext:{project:'Project'}}),set:async()=>{}}}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/live.js','utf8'),{
+  vm.runInNewContext(liveSource(),{
     document:{getElementById:()=>root,documentElement:{dataset:{}},hidden:false},
     window:{matchMedia:()=>({matches:false})},chrome,URL,Set,Map,Promise,
     setInterval:()=>0,setTimeout,clearTimeout,queueMicrotask,

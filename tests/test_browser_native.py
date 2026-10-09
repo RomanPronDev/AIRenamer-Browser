@@ -43,6 +43,96 @@ class BrowserNativeTests(unittest.TestCase):
     def target(self):
         return {"project": "DEMO", "sequence": None, "shot": "SH010"}
 
+    def test_create_shot_defaults_and_prepare_existing_shot_preserve_files(self):
+        result = self.host.dispatch({"type": "create_shot", "payload": {**self.target(), "shot": "SH020"}})
+        new = self.shots / "SH020"
+        self.assertEqual(Path(result["path"]), new)
+        self.assertEqual([Path(path) for path in result["folders"]],
+                         [new / "genai" / "KEYFRAMES", new / "genai" / "VIDEO"])
+        self.assertTrue(all(Path(path).is_dir() for path in result["folders"]))
+        self.assertEqual(self.host.navigation({"project": "DEMO"})["shots"], ["SH010", "SH020"])
+        marker = new / "genai" / "KEYFRAMES" / "original.png"
+        marker.write_bytes(b"keep")
+        for _ in range(2):
+            self.host.dispatch({"type": "create_media_folders", "payload": {**self.target(), "shot": "SH020"}})
+        self.assertEqual(marker.read_bytes(), b"keep")
+        with self.assertRaisesRegex(browser_native.HostError, "already exists"):
+            self.host.create_shot({**self.target(), "shot": "sh020"})
+        self.assertEqual(marker.read_bytes(), b"keep")
+        self.host.create_media_folders(self.target())
+        self.assertTrue((self.shot / "genai" / "VIDEO").is_dir())
+
+    def test_create_shot_uses_custom_defaults_in_an_empty_shots_tree(self):
+        self.host.set_default_structure({"scenePrefix": "production/shots", "shotPrefix": "plates",
+            "targetPrefix": "media/ai", "imageFolder": "STILLS", "videoFolder": "CLIPS", "defaultLayout": "shots"})
+        info = self.host.shot_creation_info({"project": "DEMO"})
+        self.assertEqual(Path(info["shotsRoot"]), self.project / "production" / "shots" / "plates")
+        self.assertEqual(info["mediaFolders"], ["STILLS", "CLIPS"])
+        result = self.host.create_shot({**self.target(), "shot": "SH020"})
+        expected = self.project / "production" / "shots" / "plates" / "SH020" / "media" / "ai"
+        self.assertEqual({Path(path) for path in result["folders"]}, {expected / "STILLS", expected / "CLIPS"})
+        self.assertTrue(all(Path(path).is_dir() for path in result["folders"]))
+        self.assertFalse((self.shots / "SH020").exists())
+
+    def test_create_shot_respects_project_override_and_selected_sequence(self):
+        for sequence in ("45", "46"):
+            (self.shots / sequence / "plates" / "ham0010").mkdir(parents=True)
+        self.host.set_project_structure({"project": "DEMO", "scenePrefix": "vfx/shots", "shotPrefix": "plates",
+            "targetPrefix": "custom-ai", "imageFolder": "IMAGES", "videoFolder": "MOVIES", "layout": "sequences"})
+        with self.assertRaisesRegex(browser_native.HostError, "Select a sequence"):
+            self.host.create_shot({**self.target(), "shot": "ham0020"})
+        with self.assertRaisesRegex(browser_native.HostError, "Unknown sequence"):
+            self.host.create_shot({**self.target(), "sequence": "47", "shot": "ham0020"})
+        result = self.host.create_shot({**self.target(), "sequence": "45", "shot": "ham0020"})
+        expected = self.shots / "45" / "plates" / "ham0020"
+        self.assertEqual(Path(result["path"]), expected)
+        self.assertTrue((expected / "custom-ai" / "IMAGES").is_dir())
+        self.assertTrue((expected / "custom-ai" / "MOVIES").is_dir())
+        self.assertFalse((self.shots / "46" / "plates" / "ham0020").exists())
+        self.assertFalse((expected / "genai").exists())
+        self.host.create_media_folders({**self.target(), "sequence": "46", "shot": "ham0010"})
+        self.assertTrue((self.shots / "46" / "plates" / "ham0010" / "custom-ai" / "MOVIES").is_dir())
+
+    def test_create_shot_rejects_unsafe_names_exclusions_and_missing_project(self):
+        for name in ("", "..", "../outside", "a/b", "a\\b", "CON", "name.", "_shotcode"):
+            with self.subTest(name=name), self.assertRaises(browser_native.HostError):
+                self.host.create_shot({**self.target(), "shot": name})
+        with patch.object(config, "IGNORED_NAMES", {"SH020", "genai"}):
+            with self.assertRaisesRegex(browser_native.HostError, "ignored"):
+                self.host.create_shot({**self.target(), "shot": "SH020"})
+            with self.assertRaisesRegex(browser_native.HostError, "ignored"):
+                self.host.create_media_folders(self.target())
+        self.assertFalse((self.shots / "SH020").exists())
+        self.assertFalse((self.shot / "genai").exists())
+        missing = Path(self.temp.name) / "offline-project"
+        with patch.object(config, "get_projects", return_value={"DEMO": str(missing)}):
+            with self.assertRaisesRegex(browser_native.HostError, "unavailable"):
+                self.host.create_shot({**self.target(), "shot": "SH020"})
+        self.assertFalse(missing.exists())
+
+    def test_create_media_folders_never_replaces_a_conflicting_file(self):
+        target = self.shot / "genai"
+        target.mkdir()
+        conflict = target / "KEYFRAMES"
+        conflict.write_bytes(b"do not overwrite")
+        with self.assertRaisesRegex(browser_native.HostError, "Could not create media folders"):
+            self.host.create_media_folders(self.target())
+        self.assertEqual(conflict.read_bytes(), b"do not overwrite")
+
+    def test_concurrent_shot_creation_only_accepts_one_request(self):
+        self.host.shot_creation_info({"project": "DEMO"})  # Cache layout before the race.
+        def create():
+            try:
+                self.host.create_shot({**self.target(), "shot": "SH020"})
+                return "created"
+            except browser_native.HostError as exc:
+                self.assertIn("already exists", str(exc))
+                return "duplicate"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(lambda _: create(), range(2)))
+        self.assertCountEqual(outcomes, ["created", "duplicate"])
+        self.assertTrue((self.shots / "SH020" / "genai" / "VIDEO").is_dir())
+
     def test_browser_media_defaults_ignore_desktop_prefixes_and_folders(self):
         with patch.object(config, "TARGET_PREFIX", "desktop-media"), \
              patch.object(config, "DIR_KEYFRAME", "desktop-images"), \
@@ -344,13 +434,13 @@ class BrowserNativeTests(unittest.TestCase):
             return str(folder), base, ("folder_create", str(folder))
 
         with patch.object(config, "FFMPEG_PATH", local_ffmpeg), \
-             patch.object(browser_native.utils, "resolve_ffmpeg", return_value=local_ffmpeg) as resolve, \
+             patch("browser_ffmpeg.provision", return_value=local_ffmpeg) as resolve, \
              patch.object(browser_native.utils, "convert_to_sequence", side_effect=make_sequence):
             job_id = self.host.convert_begin(payload)["jobId"]
             self.host.conversions[job_id]["thread"].join(timeout=5)
             result = self.host.convert_status({"jobId": job_id})
         self.assertEqual(result["state"], "complete")
-        resolve.assert_called_once_with(target_path=local_ffmpeg, allow_frozen_download=True, timeout=600)
+        resolve.assert_called_once_with(local_ffmpeg, timeout=600)
         self.assertTrue(Path(result["folder"]).is_dir())
         self.assertTrue(self.host.files(self.target())["files"][0]["converted"])
 
@@ -360,7 +450,7 @@ class BrowserNativeTests(unittest.TestCase):
         imported = self.host.import_file({**self.target(), "source": str(video)})
         payload = {**self.target(), "category": imported["category"], "name": imported["name"]}
         with patch.object(config, "FFMPEG_PATH", str(Path(self.temp.name) / "missing.exe")), \
-             patch.object(browser_native.utils, "resolve_ffmpeg", side_effect=RuntimeError("Network unavailable")):
+             patch("browser_ffmpeg.provision", side_effect=RuntimeError("Network unavailable")):
             job_id = self.host.convert_begin(payload)["jobId"]
             self.host.conversions[job_id]["thread"].join(timeout=5)
             result = self.host.convert_status({"jobId": job_id})
@@ -381,7 +471,7 @@ class BrowserNativeTests(unittest.TestCase):
             raise RuntimeError("Sequence conversion cancelled.")
 
         with patch.object(config, "FFMPEG_PATH", "local-ffmpeg.exe"), \
-             patch.object(browser_native.utils, "validate_ffmpeg_executable", return_value=True), \
+             patch("browser_ffmpeg.provision", return_value="local-ffmpeg.exe"), \
              patch.object(browser_native.utils, "convert_to_sequence", side_effect=wait_for_cancel):
             job_id = self.host.convert_begin(payload)["jobId"]
             self.assertTrue(started.wait(timeout=5))
@@ -404,7 +494,9 @@ class BrowserNativeTests(unittest.TestCase):
         (frames / f"{frames.name}_00001.png").write_bytes(b"frame")
         with patch.object(browser_native.subprocess, "Popen") as launched:
             self.assertEqual(self.host.open_folder(payload), {"opened": True})
-        self.assertEqual(launched.call_args.args[0], ["explorer.exe", "/select,", str(frames)])
+        self.assertEqual(launched.call_args.args[0],
+                         ["/usr/bin/open", "-R", str(frames)] if browser_native.browser_platform.is_macos()
+                         else ["explorer.exe", "/select,", str(frames)])
         image = self.host.import_file({**self.target(), "source": str(self.source)})
         with self.assertRaises(browser_native.HostError):
             self.host.open_folder({**self.target(), "category": image["category"],
@@ -416,7 +508,8 @@ class BrowserNativeTests(unittest.TestCase):
         with patch.object(browser_native.subprocess, "Popen") as launched:
             self.assertEqual(self.host.open_folder(payload), {"opened": True})
         self.assertEqual(launched.call_args.args[0],
-                         ["explorer.exe", "/select,", imported["path"]])
+                         ["/usr/bin/open", "-R", imported["path"]] if browser_native.browser_platform.is_macos()
+                         else ["explorer.exe", "/select,", imported["path"]])
         with self.assertRaises(browser_native.HostError):
             self.host.open_folder({**payload, "file": "not-in-shot.png"})
 

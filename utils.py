@@ -931,6 +931,10 @@ def resolve_ffmpeg(
     be installed, the operation fails without attempting any network access.
     Browser's standalone host may opt into the verified BtbN download.
     """
+    if sys.platform == "darwin":
+        import browser_ffmpeg
+        return browser_ffmpeg.resolve(target_path or os.path.join(tools_dir or config.TOOLS_DIR, "ffmpeg"),
+                                      timeout=timeout)
     tools_dir = tools_dir or config.TOOLS_DIR
     target_path = target_path or (os.path.join(tools_dir, "ffmpeg.exe") if tools_dir else "")
     if not target_path:

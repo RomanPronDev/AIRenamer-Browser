@@ -124,6 +124,15 @@ internal static class DragBridge {
         if (args.Length == 2 && args[0] == "--probe") { Application.Run(ShowProbe(Path.GetFullPath(args[1]))); return; }
         Application.OleRequired();
         source = new Control();
+        // Chrome owns the original mouse-down. This STA's message queue can report
+        // stale grfKeyState and cancel a cross-process drag immediately. Use the
+        // physically held button until release, while still honoring Escape.
+        source.QueryContinueDrag += (sender, e) => {
+            if (e.EscapePressed || (GetAsyncKeyState(27) & 0x8000) != 0)
+                e.Action = DragAction.Cancel;
+            else e.Action = (GetAsyncKeyState(1) & 0x8000) != 0
+                ? DragAction.Continue : DragAction.Drop;
+        };
         var handle = source.Handle; // Message-only use: the control is never shown.
         Reply(new { id = "ready", ok = true, ready = true });
         var reader = new Thread(ReadCommands) { IsBackground = true };

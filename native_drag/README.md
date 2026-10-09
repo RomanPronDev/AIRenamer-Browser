@@ -1,4 +1,4 @@
-# Direct drag handoff · 0.27.8
+# Direct drag handoff · 0.29.0
 
 The interface stays in Chrome's actual side panel. No desktop panel, overlay, global mouse hook, administrator rights, or browser injection is added. These are experimental paths, not a compatibility guarantee for Adobe or Nuke.
 
@@ -16,6 +16,8 @@ Native drag is enabled by default. The extension warms the helper at Chrome/exte
 
 At row `dragstart`, the panel cancels Chromium's drag and sends the file capability plus the gesture timestamp through Native Messaging. The companion uses a capability minted during Files listing to avoid another network tree traversal. A hidden Windows Forms control on an STA thread offers the original path as Windows `CF_HDROP` through `DoDragDrop`. It never shows a drag-source window. Requests expire after 750 ms and are rejected if the physical left button is already released. Missing files, stale tokens, and overlapping drags are rejected. Only Copy is offered to outside applications; the source is not moved or deleted.
 
+In 0.29.0, QueryContinueDrag follows the physical left button with GetAsyncKeyState, including Escape cancellation. The helper's STA message queue does not own Chrome's original mouse-down, so its cached key-state flags can otherwise end the handoff immediately. This is a source-side correction; actual target-app acceptance still requires an observed gesture. Background read caching and panel restoration reduce repeat network reads, but do not remove the 750 ms freshness guard.
+
 The helper is compiled from `DragBridge.cs` using the Windows .NET Framework compiler, included inside the native companion by PyInstaller, and started once with redirected pipes and no console. It uses the machine's .NET Framework 4.x and Windows Forms runtime; no Qt/Electron/WebView runtime is added. At idle it waits for messages with no polling timer. Closing the native host closes its pipe and terminates the helper; changing back to Chrome mode stops it explicitly. No separate install action is needed after the existing Browser package update. FFmpeg remains outside the package.
 
 ## Verified and still unverified
@@ -30,7 +32,7 @@ On the development machine: cold readiness 81.24 ms; 50 warmed ping requests ave
 
 ## Manual acceptance test
 
-1. Install the local 0.27.8 Browser package; reopen Chrome so the new extension and companion are loaded.
+1. Install the local 0.29.0 Browser package; reopen Chrome so the new extension and companion are loaded.
 2. Wait for **Drag a file into an app · Move handle for shots** in Files; no manual enable step is needed. No source window should appear.
 3. In Settings, click **Open drag test target**. Drag a file's name, row, or left media icon from the panel into it in one continuous gesture. The displayed path must be the original project file, not a `chrome_drag` temporary copy. The probe logs accepted paths/formats to `%LOCALAPPDATA%\MediaRenamer\Browser\drag-probe.jsonl`.
 4. Repeat with PNG and video, Unicode/spaces, a network project, quick release, Escape/cancel, several Chrome windows, different displays/scaling, and restart. Confirm no source rename/move/copy and no orphan helper after Chrome exits.
